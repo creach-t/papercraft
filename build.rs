@@ -29,29 +29,39 @@ fn build_resource() -> Result<()> {
             ),
         )?;
         let output = std::path::PathBuf::from(&output_dir).join("resource.o");
-        #[allow(clippy::option_env_unwrap)]
-        let status = if let Some(windres) = option_env!("WINDRES") {
-            std::process::Command::new(windres)
+        // Look up at runtime so the tool path can be changed without recompiling the build script
+        let windres = std::env::var("WINDRES").ok();
+        let rc = std::env::var("RC").ok();
+        let compiled = if let Some(windres) = windres {
+            let status = std::process::Command::new(&windres)
                 .arg("-I")
                 .arg(&output_dir)
                 .arg("res/resource.rc")
                 .arg(&output)
-                .status()?
-        } else if let Some(rc) = option_env!("RC") {
-            std::process::Command::new(rc)
+                .status()?;
+            if !status.success() {
+                eprintln!("cargo:warning=windres failed, skipping resource compilation");
+                false
+            } else { true }
+        } else if let Some(rc) = rc {
+            let status = std::process::Command::new(&rc)
                 .arg("/i")
                 .arg(&output_dir)
                 .arg("/fo")
                 .arg(&output)
                 .arg("res/resource.rc")
-                .status()?
+                .status()?;
+            if !status.success() {
+                eprintln!("cargo:warning=rc failed, skipping resource compilation");
+                false
+            } else { true }
         } else {
-            return Err(std::io::Error::other("RC or WINDRES should be defined"));
+            eprintln!("cargo:warning=No resource compiler found (set WINDRES or RC), skipping");
+            false
         };
-        if !status.success() {
-            return Err(std::io::Error::other("windres error"));
+        if compiled {
+            println!("cargo:rustc-link-arg={}", output.display());
         }
-        println!("cargo:rustc-link-arg={}", output.display());
         for entry in std::fs::read_dir("res")? {
             let entry = entry?;
             println!("cargo:rerun-if-changed={}", entry.path().display());

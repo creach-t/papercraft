@@ -440,6 +440,7 @@ enum FileAction {
     UpdateObj,
     ExportObj,
     GeneratePrintable,
+    Generate3dPdf,
 }
 
 impl FileAction {
@@ -451,6 +452,7 @@ impl FileAction {
             FileAction::UpdateObj => tr!("Updating..."),
             FileAction::ExportObj => tr!("Exporting..."),
             FileAction::GeneratePrintable => tr!("Generating..."),
+            FileAction::Generate3dPdf => tr!("Generating 3D PDF..."),
         }
     }
     fn is_save(&self) -> bool {
@@ -459,7 +461,7 @@ impl FileAction {
             | FileAction::OpenCraftReadOnly
             | FileAction::ImportModel
             | FileAction::UpdateObj => false,
-            FileAction::SaveAsCraft | FileAction::ExportObj | FileAction::GeneratePrintable => true,
+            FileAction::SaveAsCraft | FileAction::ExportObj | FileAction::GeneratePrintable | FileAction::Generate3dPdf => true,
         }
     }
 }
@@ -687,6 +689,7 @@ struct MenuActions {
     update_model: BoolWithConfirm,
     export_obj: bool,
     generate_printable: bool,
+    generate_3d_pdf: bool,
     quit: BoolWithConfirm,
     reset_views: bool,
     undo: bool,
@@ -1901,6 +1904,12 @@ impl GlobalContext {
                 {
                     menu_actions.generate_printable = true;
                 }
+                if ui
+                    .menu_item_config(lbl(tr!("Export 3D Views PDF...")))
+                    .build()
+                {
+                    menu_actions.generate_3d_pdf = true;
+                }
                 ui.separator();
                 if ui
                     .menu_item_config(lbl(tr!("Settings...")))
@@ -2457,6 +2466,18 @@ impl GlobalContext {
                 chooser,
                 tr!("Generate Printable..."),
                 FileAction::GeneratePrintable,
+            ));
+            open_file_dialog = true;
+        }
+        if menu_actions.generate_3d_pdf {
+            let mut chooser = filechooser::FileChooser::new();
+            let _ = chooser.set_path(&self.last_path);
+            chooser.add_filter(filters::pdf());
+            chooser.add_filter(filters::all_files());
+            self.file_dialog = Some(FileDialog::new(
+                chooser,
+                tr!("Export 3D Views PDF..."),
+                FileAction::Generate3dPdf,
             ));
             open_file_dialog = true;
         }
@@ -3052,6 +3073,9 @@ impl GlobalContext {
             FileAction::GeneratePrintable => {
                 self.generate_printable(imgui, file_name, action.file_format)?;
             }
+            FileAction::Generate3dPdf => {
+                self.generate_3d_pdf_views(file_name)?;
+            }
         }
         Ok(())
     }
@@ -3185,6 +3209,285 @@ impl GlobalContext {
             );
             pixbuf
         }
+    }
+
+    fn generate_3d_pdf_views(&mut self, file_name: &Path) -> Result<()> {
+        use lopdf::{
+            Document, Object, ObjectId, Stream, StringFormat,
+            content::{Content, Operation},
+            dictionary,
+            xref::XrefType,
+        };
+        use cgmath::Quaternion;
+        use rayon::prelude::*;
+
+        const VIEW_SIZE: i32 = 512;
+
+        // (label, rotation_axis_angle: optional (axis_xyz, degrees_f32))
+        type V3 = cgmath::Vector3<f32>;
+        let views: &[(&str, Option<(V3, f32)>)] = &[
+            ("Front",  None),
+            ("Back",   Some((V3::new(0.0, 1.0, 0.0), 180.0_f32))),
+            ("Right",  Some((V3::new(0.0, 1.0, 0.0), -90.0_f32))),
+            ("Left",   Some((V3::new(0.0, 1.0, 0.0),  90.0_f32))),
+            ("Top",    Some((V3::new(1.0, 0.0, 0.0), -90.0_f32))),
+            ("Bottom", Some((V3::new(1.0, 0.0, 0.0),  90.0_f32))),
+        ];
+
+        // Save current state and set up a clean scene
+        let thumb_data = self.data.prepare_thumbnail(
+            Vector2::new(VIEW_SIZE as f32, VIEW_SIZE as f32),
+        );
+
+        let fbo  = glr::Framebuffer::generate(&self.gl)?;
+        let rbo  = glr::Renderbuffer::generate(&self.gl)?;
+        let rboz = glr::Renderbuffer::generate(&self.gl)?;
+
+        let mut view_images: Vec<(&str, image::RgbaImage)> = Vec::new();
+
+        unsafe {
+            let fb_binder = BinderFramebuffer::bind(&fbo);
+
+            let rb_binder = glr::BinderRenderbuffer::bind(&rbo);
+            self.gl.renderbuffer_storage(rb_binder.target(), glow::RGBA8, VIEW_SIZE, VIEW_SIZE);
+            self.gl.framebuffer_renderbuffer(
+                fb_binder.target(), glow::COLOR_ATTACHMENT0,
+                glow::RENDERBUFFER, Some(rbo.id()),
+            );
+            rb_binder.rebind(&rboz);
+            self.gl.renderbuffer_storage(rb_binder.target(), glow::DEPTH_COMPONENT, VIEW_SIZE, VIEW_SIZE);
+            self.gl.framebuffer_renderbuffer(
+                fb_binder.target(), glow::DEPTH_ATTACHMENT,
+                glow::RENDERBUFFER, Some(rboz.id()),
+            );
+
+            // Flip Y so the captured image is right-side up (same trick as create_thumbnail)
+            self.data.ui.trans_scene.persp.y.y *= -1.0;
+            self.gl.front_face(glow::CW);
+
+            self.data.pre_render(RebuildFlags::all(), &TextBuilderDummy);
+            self.gl.viewport(0, 0, VIEW_SIZE, VIEW_SIZE);
+
+            self.gl.enable(glow::DEPTH_TEST);
+            self.gl.depth_func(glow::LEQUAL);
+            self.gl.enable(glow::BLEND);
+            self.gl.blend_func_separate(
+                glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA,
+                glow::ONE,       glow::ONE_MINUS_SRC_ALPHA,
+            );
+
+            for &(label, ref rotation) in views.iter() {
+                self.data.ui.trans_scene.rotation = match rotation {
+                    None => Quaternion::one(),
+                    Some((axis, angle)) => Quaternion::from_axis_angle(*axis, Deg(*angle)),
+                };
+                self.data.ui.trans_scene.recompute_obj();
+
+                self.gl.clear_color(1.0, 1.0, 1.0, 1.0);
+                self.gl.clear_depth_f32(1.0);
+                self.gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
+
+                self.render_scene(1.0);
+
+                self.gl.read_buffer(glow::COLOR_ATTACHMENT0);
+                self.gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+                let mut pixbuf = image::RgbaImage::new(VIEW_SIZE as u32, VIEW_SIZE as u32);
+                self.gl.read_pixels(
+                    0, 0, VIEW_SIZE, VIEW_SIZE,
+                    glow::RGBA, glow::UNSIGNED_BYTE,
+                    glow::PixelPackData::Slice(Some(&mut pixbuf)),
+                );
+                view_images.push((label, pixbuf));
+            }
+
+            self.gl.front_face(glow::CCW);
+        }
+
+        self.data.restore_thumbnail(thumb_data);
+        self.add_rebuild(RebuildFlags::all());
+
+        // --- Build PDF ---
+        // A4 landscape: 297 × 210 mm  →  points (72 pt/inch)
+        let page_w = 297.0_f32 * 72.0 / 25.4;
+        let page_h = 210.0_f32 * 72.0 / 25.4;
+        let margin  = 18.0_f32;
+        let gap     = 8.0_f32;
+        let title_h = 22.0_f32;
+        let label_h = 14.0_f32;
+        let cols    = 3_usize;
+        let rows    = 2_usize;
+
+        let view_w = (page_w - 2.0 * margin - (cols - 1) as f32 * gap) / cols as f32;
+        let view_h = (page_h - 2.0 * margin - title_h - label_h * rows as f32 - (rows - 1) as f32 * gap) / rows as f32;
+        let cell_h  = view_h.min(view_w);       // square views
+        let actual_view_w = cell_h;              // keep them square
+
+        let mut doc = Document::with_version("1.4");
+        doc.reference_table.cross_reference_type = XrefType::CrossReferenceTable;
+
+        let id_pages = doc.new_object_id();
+        let id_font  = doc.add_object(dictionary! {
+            "Type"     => "Font",
+            "Subtype"  => "Type1",
+            "BaseFont" => "Helvetica",
+            "Encoding" => "WinAnsiEncoding",
+        });
+
+        // Pre-allocate image object IDs
+        let id_pairs: Vec<(ObjectId, ObjectId)> = (0..view_images.len())
+            .map(|_| (doc.new_object_id(), doc.new_object_id()))
+            .collect();
+
+        // Parallel compression (same pattern as generate_pdf)
+        let (tx_compress, rx_compress) =
+            std::sync::mpsc::channel::<(ObjectId, ObjectId, image::RgbaImage)>();
+        let (tx_done, rx_done) = std::sync::mpsc::channel::<(ObjectId, Stream)>();
+        rayon::spawn(move || {
+            rx_compress
+                .into_iter()
+                .par_bridge()
+                .flat_map(|(id_mask, id_img, pixbuf)| {
+                    let (w, h) = pixbuf.dimensions();
+                    let mut rgb   = vec![0u8; (3 * w * h) as usize];
+                    let mut alpha = vec![0u8; (w * h) as usize];
+                    for (n, px) in pixbuf.pixels().enumerate() {
+                        let c = px.channels();
+                        rgb[3 * n..][..3].copy_from_slice(&c[..3]);
+                        alpha[n] = c[3];
+                    }
+                    let s_mask = Stream::new(dictionary! {
+                        "Type" => "XObject", "Subtype" => "Image",
+                        "Width" => w, "Height" => h,
+                        "BitsPerComponent" => 8, "ColorSpace" => "DeviceGray",
+                    }, alpha);
+                    let s_img = Stream::new(dictionary! {
+                        "Type" => "XObject", "Subtype" => "Image",
+                        "Width" => w, "Height" => h,
+                        "BitsPerComponent" => 8, "ColorSpace" => "DeviceRGB",
+                        "SMask" => id_mask,
+                    }, rgb);
+                    [(id_mask, s_mask), (id_img, s_img)]
+                })
+                .for_each(|(id, mut s)| {
+                    let _ = s.compress();
+                    tx_done.send((id, s)).unwrap();
+                });
+            drop(tx_done);
+        });
+
+        // Build page content ops
+        let mut ops: Vec<Operation> = Vec::new();
+        let mut xobj_names: Vec<(String, ObjectId)> = Vec::new();
+
+        // Title
+        let title_text = self.title(false);
+        ops.push(Operation::new("BT", vec![]));
+        ops.push(Operation::new("Tf", vec!["F1".into(), 14.0_f32.into()]));
+        ops.push(Operation::new("Tm", vec![
+            1.0_f32.into(), 0.0_f32.into(), 0.0_f32.into(), 1.0_f32.into(),
+            margin.into(), (page_h - margin - 14.0_f32).into(),
+        ]));
+        ops.push(Operation::new("Tj", vec![
+            Object::String(title_text.into_bytes(), StringFormat::Literal),
+        ]));
+        ops.push(Operation::new("ET", vec![]));
+
+        for (i, ((label, pixbuf), (id_mask, id_img))) in
+            view_images.iter().zip(id_pairs.iter()).enumerate()
+        {
+            let col = i % cols;
+            let row = i / cols;
+
+            // X: distribute 3 columns
+            let x = margin + col as f32 * (actual_view_w + gap);
+            // Y from top: title + row * (view + label + gap)
+            let top_offset = margin + title_h + row as f32 * (cell_h + label_h + gap);
+            let y = page_h - top_offset - cell_h;
+
+            let img_name = format!("IMG{i}");
+
+            // Draw image
+            ops.push(Operation::new("q", vec![]));
+            ops.push(Operation::new("cm", vec![
+                actual_view_w.into(), 0.0_f32.into(), 0.0_f32.into(), cell_h.into(),
+                x.into(), y.into(),
+            ]));
+            ops.push(Operation::new("Do", vec![img_name.clone().into()]));
+            ops.push(Operation::new("Q", vec![]));
+
+            // Border
+            ops.push(Operation::new("w", vec![0.4_f32.into()]));
+            ops.push(Operation::new("RG", vec![0.6_f32.into(), 0.6_f32.into(), 0.6_f32.into()]));
+            ops.push(Operation::new("re", vec![x.into(), y.into(), actual_view_w.into(), cell_h.into()]));
+            ops.push(Operation::new("S", vec![]));
+
+            // Label centered below image
+            let label_y = y - label_h + 2.0;
+            ops.push(Operation::new("BT", vec![]));
+            ops.push(Operation::new("Tf", vec!["F1".into(), 10.0_f32.into()]));
+            ops.push(Operation::new("Tm", vec![
+                1.0_f32.into(), 0.0_f32.into(), 0.0_f32.into(), 1.0_f32.into(),
+                (x + actual_view_w / 2.0 - label.len() as f32 * 3.0).into(), label_y.into(),
+            ]));
+            ops.push(Operation::new("Tj", vec![
+                Object::String(label.as_bytes().to_vec(), StringFormat::Literal),
+            ]));
+            ops.push(Operation::new("ET", vec![]));
+
+            xobj_names.push((img_name, *id_img));
+            tx_compress.send((*id_mask, *id_img, pixbuf.clone())).unwrap();
+        }
+        drop(tx_compress);
+
+        for (id, stream) in rx_done.into_iter() {
+            doc.set_object(id, stream);
+        }
+
+        let content = Content { operations: ops };
+        let id_content = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+
+        let mut xobj_dict = lopdf::Dictionary::new();
+        for (name, id) in xobj_names {
+            xobj_dict.set(name, Object::Reference(id));
+        }
+
+        let id_resources = doc.add_object(dictionary! {
+            "Font"    => dictionary! { "F1" => id_font },
+            "XObject" => Object::Dictionary(xobj_dict),
+        });
+
+        let id_page = doc.add_object(dictionary! {
+            "Type"     => "Page",
+            "Parent"   => id_pages,
+            "MediaBox" => vec![0i32.into(), 0i32.into(), page_w.into(), page_h.into()],
+            "Contents" => id_content,
+            "Resources"=> id_resources,
+        });
+
+        let pdf_pages = dictionary! {
+            "Type"  => "Pages",
+            "Count" => 1i32,
+            "Kids"  => vec![id_page.into()],
+        };
+        doc.set_object(id_pages, pdf_pages);
+
+        let id_catalog = doc.add_object(dictionary! {
+            "Type"  => "Catalog",
+            "Pages" => id_pages,
+        });
+        doc.trailer.set("Root", id_catalog);
+
+        let id_info = doc.add_object(dictionary! {
+            "Title"   => Object::string_literal(self.title(false)),
+            "Creator" => Object::string_literal(signature()),
+        });
+        doc.trailer.set("Info", id_info);
+
+        doc.compress();
+        doc.save(file_name)
+            .with_context(|| tr!("Error saving file {}", file_name.display()))?;
+
+        Ok(())
     }
 
     fn save_as_craft(&self, file_name: &Path, thumbnail: Option<image::RgbaImage>) -> Result<()> {
