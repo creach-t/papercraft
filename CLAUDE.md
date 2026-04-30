@@ -197,7 +197,43 @@ Génère un PDF A4 paysage avec 6 vues du modèle assemblé (Front/Back/Left/Rig
 
 - Menu : *File → Export 3D Views PDF...*
 - Rendu : FBO OpenGL 512×512 px par vue, 6 rotations de caméra
-- PDF : lopdf, compression parallèle rayon, titre + labels
+- PDF : lopdf, compression parallèle rayon, titre centré
+- Fond blanc, lignes de découpe en bleu (couleur hardcodée pour le PDF, restaurée après)
+- Pas de labels de vue (Front/Back/…) dans le PDF final
+- Scale auto-fit exact par vue : formule perspective `S = fill * camera_dist / (|rv.x| * focal + fill * rv.z)`, minimum sur tous les sommets → modèle remplit ~92% de chaque cellule sans déborder
+
+#### Points d'attention pour modifier cette fonction
+
+**Couleur des lignes de découpe**
+`prepare_thumbnail()` désactive `show_3d_lines`. Il faut le réactiver juste après :
+```rust
+let thumb_data = self.data.prepare_thumbnail(...);
+self.data.ui.show_3d_lines = true;
+```
+La couleur est injectée via `options_mut().line3d_cut.color` avant `pre_render`, puis restaurée après le rendu.
+
+**Auto-scale perspective-correct**
+Pour chaque vue, après avoir fixé la rotation :
+```rust
+// Vertices normalisés = après obj (centrage + normalisation à 1 unité), avant rotation/scale
+// rv = rot_mat * v_normalized
+// S = fill * camera_dist / (|rv.proj| * focal + fill * rv.z)   (min sur tous les sommets)
+let tight_scale = normalized_verts.iter().fold(f32::INFINITY, |min_s, v| {
+    let rv = rot_mat * *v;
+    let lim = |proj: f32| {
+        let d = proj.abs() * focal + FILL * rv.z;
+        if d > 0.0 { FILL * camera_dist / d } else { f32::INFINITY }
+    };
+    min_s.min(lim(rv.x)).min(lim(rv.y))
+});
+self.data.ui.trans_scene.scale = tight_scale;
+self.data.ui.trans_scene.recompute_obj();
+```
+`focal = persp[1][1]`, `camera_dist = -location.z = 30.0`.
+
+**Nouvelles méthodes ajoutées**
+- `Papercraft::options_mut()` (`paper/craft.rs`) — accès mutable aux options sans passer par `set_options`
+- `PapercraftContext::papercraft_mut()` (`ui.rs`) — accès mutable au papercraft sous-jacent
 
 ---
 

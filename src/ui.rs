@@ -575,6 +575,9 @@ impl PapercraftContext {
     pub fn papercraft(&self) -> &Papercraft {
         &self.papercraft
     }
+    pub fn papercraft_mut(&mut self) -> &mut Papercraft {
+        &mut self.papercraft
+    }
     pub fn gl_objs(&self) -> &GLObjects {
         &self.gl_objs
     }

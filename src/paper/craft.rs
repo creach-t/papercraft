@@ -535,6 +535,9 @@ impl Papercraft {
     pub fn options(&self) -> &PaperOptions {
         &self.options
     }
+    pub fn options_mut(&mut self) -> &mut PaperOptions {
+        &mut self.options
+    }
     // Returns the old options
     pub fn set_options(
         &mut self,

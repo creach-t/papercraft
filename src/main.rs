@@ -3238,6 +3238,30 @@ impl GlobalContext {
         let thumb_data = self.data.prepare_thumbnail(
             Vector2::new(VIEW_SIZE as f32, VIEW_SIZE as f32),
         );
+        // prepare_thumbnail disables 3d lines (thumbnail use), re-enable to show cut edges
+        self.data.ui.show_3d_lines = true;
+
+        // Pre-compute normalized vertex positions (after obj transform, before rotation/scale)
+        // used for per-view tight-fit auto-scale
+        let obj_mat = self.data.ui.trans_scene.obj;
+        let normalized_verts: Vec<Vector3<f32>> = self.data.papercraft()
+            .model()
+            .vertices()
+            .map(|(_, v)| {
+                use cgmath::Transform;
+                let p = v.pos();
+                obj_mat.transform_point(cgmath::Point3::new(p.x, p.y, p.z)).to_vec()
+            })
+            .collect();
+        // focal = persp[1][1] = 1/tan(FOV/2), camera at z = location.z = -30
+        let focal = self.data.ui.trans_scene.persp[1][1];
+        let camera_dist = -self.data.ui.trans_scene.location.z;
+        let bg = Rgba::new(1.0, 1.0, 1.0, 1.0);
+
+        // Override cut-line colour to blue for the PDF, restore afterwards
+        let orig_cut_color = self.data.papercraft().options().line3d_cut.color;
+        self.data.papercraft_mut().options_mut().line3d_cut.color =
+            imgui::Color::new(0.18, 0.45, 1.0, 1.0);
 
         let fbo  = glr::Framebuffer::generate(&self.gl)?;
         let rbo  = glr::Renderbuffer::generate(&self.gl)?;
@@ -3265,6 +3289,7 @@ impl GlobalContext {
             self.data.ui.trans_scene.persp.y.y *= -1.0;
             self.gl.front_face(glow::CW);
 
+            // pre_render builds edge-status buffer — must happen AFTER colour override above
             self.data.pre_render(RebuildFlags::all(), &TextBuilderDummy);
             self.gl.viewport(0, 0, VIEW_SIZE, VIEW_SIZE);
 
@@ -3281,9 +3306,33 @@ impl GlobalContext {
                     None => Quaternion::one(),
                     Some((axis, angle)) => Quaternion::from_axis_angle(*axis, Deg(*angle)),
                 };
+
+                // Exact perspective-correct tight-fit scale for this view.
+                // For each vertex v in normalized space, the clip-x at scale S is:
+                //   clip_x = rv.x * S / (camera_dist - rv.z * S) * focal
+                // Solving for S where |clip_x| = fill gives:
+                //   S = fill * camera_dist / (|rv.x| * focal + fill * rv.z)
+                // We take the minimum over all vertices (most constraining).
+                {
+                    use cgmath::Matrix3;
+                    const FILL: f32 = 0.92;
+                    let rot_mat = Matrix3::from(self.data.ui.trans_scene.rotation);
+                    let tight_scale = normalized_verts.iter()
+                        .fold(f32::INFINITY, |min_s, v| {
+                            let rv = rot_mat * *v;
+                            let lim = |proj: f32| {
+                                let d = proj.abs() * focal + FILL * rv.z;
+                                if d > 0.0 { FILL * camera_dist / d } else { f32::INFINITY }
+                            };
+                            min_s.min(lim(rv.x)).min(lim(rv.y))
+                        });
+                    if tight_scale.is_finite() && tight_scale > 0.0 {
+                        self.data.ui.trans_scene.scale = tight_scale;
+                    }
+                }
                 self.data.ui.trans_scene.recompute_obj();
 
-                self.gl.clear_color(1.0, 1.0, 1.0, 1.0);
+                self.gl.clear_color(bg.r, bg.g, bg.b, bg.a);
                 self.gl.clear_depth_f32(1.0);
                 self.gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
 
@@ -3304,6 +3353,8 @@ impl GlobalContext {
         }
 
         self.data.restore_thumbnail(thumb_data);
+        // Restore cut-line colour that was overridden for the PDF
+        self.data.papercraft_mut().options_mut().line3d_cut.color = orig_cut_color;
         self.add_rebuild(RebuildFlags::all());
 
         // --- Build PDF ---
@@ -3313,12 +3364,11 @@ impl GlobalContext {
         let margin  = 18.0_f32;
         let gap     = 8.0_f32;
         let title_h = 22.0_f32;
-        let label_h = 14.0_f32;
         let cols    = 3_usize;
         let rows    = 2_usize;
 
         let view_w = (page_w - 2.0 * margin - (cols - 1) as f32 * gap) / cols as f32;
-        let view_h = (page_h - 2.0 * margin - title_h - label_h * rows as f32 - (rows - 1) as f32 * gap) / rows as f32;
+        let view_h = (page_h - 2.0 * margin - title_h - (rows - 1) as f32 * gap) / rows as f32;
         let cell_h  = view_h.min(view_w);       // square views
         let actual_view_w = cell_h;              // keep them square
 
@@ -3392,7 +3442,7 @@ impl GlobalContext {
         ]));
         ops.push(Operation::new("ET", vec![]));
 
-        for (i, ((label, pixbuf), (id_mask, id_img))) in
+        for (i, ((_label, pixbuf), (id_mask, id_img))) in
             view_images.iter().zip(id_pairs.iter()).enumerate()
         {
             let col = i % cols;
@@ -3400,8 +3450,8 @@ impl GlobalContext {
 
             // X: distribute 3 columns
             let x = margin + col as f32 * (actual_view_w + gap);
-            // Y from top: title + row * (view + label + gap)
-            let top_offset = margin + title_h + row as f32 * (cell_h + label_h + gap);
+            // Y from top: title + row * (view + gap)
+            let top_offset = margin + title_h + row as f32 * (cell_h + gap);
             let y = page_h - top_offset - cell_h;
 
             let img_name = format!("IMG{i}");
@@ -3420,19 +3470,6 @@ impl GlobalContext {
             ops.push(Operation::new("RG", vec![0.6_f32.into(), 0.6_f32.into(), 0.6_f32.into()]));
             ops.push(Operation::new("re", vec![x.into(), y.into(), actual_view_w.into(), cell_h.into()]));
             ops.push(Operation::new("S", vec![]));
-
-            // Label centered below image
-            let label_y = y - label_h + 2.0;
-            ops.push(Operation::new("BT", vec![]));
-            ops.push(Operation::new("Tf", vec!["F1".into(), 10.0_f32.into()]));
-            ops.push(Operation::new("Tm", vec![
-                1.0_f32.into(), 0.0_f32.into(), 0.0_f32.into(), 1.0_f32.into(),
-                (x + actual_view_w / 2.0 - label.len() as f32 * 3.0).into(), label_y.into(),
-            ]));
-            ops.push(Operation::new("Tj", vec![
-                Object::String(label.as_bytes().to_vec(), StringFormat::Literal),
-            ]));
-            ops.push(Operation::new("ET", vec![]));
 
             xobj_names.push((img_name, *id_img));
             tx_compress.send((*id_mask, *id_img, pixbuf.clone())).unwrap();
