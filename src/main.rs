@@ -57,7 +57,7 @@ const KARLA_TTF: &[u8] = include_bytes!("Karla-Regular.ttf");
 const FONT_SIZE: f32 = 3.0;
 
 use paper::{
-    EdgeIdPosition, FlapStyle, FoldStyle, IslandKey, PaperOptions, Papercraft,
+    EdgeIdPosition, FlapStyle, FoldStyle, IslandKey, Label, PaperOptions, Papercraft,
     formats::{export_model_file, import_model_file},
 };
 use util_3d::Matrix3;
@@ -243,6 +243,7 @@ impl easy_imgui_window::Application for Box<GlobalContext> {
             title: String::new(),
             textures_to_delete: Vec::new(),
             proxy: local_proxy,
+            label_title_buf: String::new(),
         };
         let mut ctx = Box::new(ctx);
         ctx.build_fonts(imgui.io_mut().font_atlas_mut());
@@ -337,6 +338,9 @@ fn build_gl_fixs(gl: &GlContext) -> Result<GLFixedObjects> {
         .with_context(|| "quad")?;
     let prg_text = util_gl::program_from_source(gl, include_str!("shaders/text.glsl"))
         .with_context(|| "text")?;
+    let prg_label_color =
+        util_gl::program_from_source(gl, include_str!("shaders/label_color.glsl"))
+            .with_context(|| "label_color")?;
 
     let vao = glr::VertexArray::generate(gl)?;
 
@@ -409,6 +413,7 @@ fn build_gl_fixs(gl: &GlContext) -> Result<GLFixedObjects> {
         prg_paper_line,
         prg_quad,
         prg_text,
+        prg_label_color,
     })
 }
 
@@ -429,6 +434,7 @@ struct GLFixedObjects {
     prg_paper_line: glr::Program,
     prg_quad: glr::Program,
     prg_text: glr::Program,
+    prg_label_color: glr::Program,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -553,6 +559,8 @@ struct GlobalContext {
     // If a texture is added to a window-list, but then deleted, it should be kept alive until after the render.
     textures_to_delete: Vec<glr::Texture>,
     proxy: LocalProxy<Box<GlobalContext>>,
+    // Buffer for editing label titles inline
+    label_title_buf: String,
 }
 
 struct FileDialog {
@@ -684,6 +692,7 @@ enum BoolWithConfirm {
 struct MenuActions {
     open: BoolWithConfirm,
     save: bool,
+    add_label: bool,
     save_as: bool,
     import_model: BoolWithConfirm,
     update_model: BoolWithConfirm,
@@ -888,6 +897,54 @@ impl GlobalContext {
                 });
                 //TODO: list third party SW
             });
+    }
+
+    fn build_label_editor(&mut self, ui: &Ui) {
+        let Some(key) = self.data.selected_label else {
+            return;
+        };
+        let Some(label) = self.data.papercraft().label_by_key(key) else {
+            // Label was removed; deselect
+            self.data.selected_label = None;
+            return;
+        };
+
+        // Sync the edit buffer when selection changes
+        if self.label_title_buf != label.title {
+            self.label_title_buf = label.title.clone();
+        }
+
+        let mut open = true;
+        ui.window_config(lbl_id(tr!("Label"), "label_editor"))
+            .open(&mut open)
+            .flags(imgui::WindowFlags::AlwaysAutoResize | imgui::WindowFlags::NoCollapse)
+            .with(|| {
+                ui.align_text_to_frame_padding();
+                ui.text(&tr!("Title:"));
+                ui.same_line();
+                let changed = ui
+                    .input_text_config(lbl_id("", "label_title"), &mut self.label_title_buf)
+                    .build();
+                if changed {
+                    if let Some(label_mut) = self.data.papercraft_mut().label_by_key_mut(key) {
+                        label_mut.title = self.label_title_buf.clone();
+                        self.data.modified = true;
+                    }
+                    self.add_rebuild(RebuildFlags::PAPER);
+                }
+
+                ui.separator();
+                if ui.button(lbl(tr!("Delete label"))) {
+                    self.data.papercraft_mut().remove_label(key);
+                    self.data.selected_label = None;
+                    self.data.modified = true;
+                    self.add_rebuild(RebuildFlags::PAPER);
+                }
+            });
+
+        if !open {
+            self.data.selected_label = None;
+        }
     }
 
     fn new_version_result(&mut self, version: Result<(Version, String)>) {
@@ -1121,6 +1178,7 @@ impl GlobalContext {
         self.build_modal_file_action(ui);
         self.build_confirm_message(ui, &mut menu_actions);
         self.build_about(ui);
+        self.build_label_editor(ui);
 
         menu_actions
     }
@@ -1990,6 +2048,11 @@ impl GlobalContext {
                         self.data.push_undo_action(undo);
                         self.add_rebuild(RebuildFlags::PAPER | RebuildFlags::SELECTION);
                     }
+
+                    ui.separator();
+                    if ui.menu_item_config(lbl(tr!("Add label"))).build() {
+                        menu_actions.add_label = true;
+                    }
                 }
             });
             ui.menu_config(lbl(tr!("View"))).with(|| {
@@ -2309,6 +2372,33 @@ impl GlobalContext {
     fn run_menu_actions(&mut self, ui: &Ui, menu_actions: &MenuActions) {
         if menu_actions.reset_views {
             self.data.reset_views(self.sz_scene, self.sz_paper);
+        }
+        if menu_actions.add_label {
+            // Place the new label at the center of the first page
+            let options = self.data.papercraft().options();
+            let page_pos = options.page_position(0);
+            let page_size = Vector2::from(options.page_size);
+            let center = page_pos + page_size / 2.0;
+            let label_size = Vector2::new(60.0, 50.0);
+            let pos = center - label_size / 2.0;
+            let model_name = self
+                .file_name
+                .as_deref()
+                .and_then(|p| p.file_stem())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| tr!("Label"));
+            let key = self
+                .data
+                .papercraft_mut()
+                .add_label(Label::new(pos, model_name.clone()));
+            self.data.selected_label = Some(key);
+            self.label_title_buf = model_name;
+            // Ensure the thumbnail texture exists; create it now if not
+            if self.data.gl_objs().label_thumbnail_tex.is_none() {
+                self.create_label_thumbnail();
+            }
+            self.data.modified = true;
+            self.add_rebuild(RebuildFlags::PAPER);
         }
         if menu_actions.undo {
             match self.data.undo_action() {
@@ -2972,7 +3062,35 @@ impl GlobalContext {
 
             self.gl.disable(glow::STENCIL_TEST);
 
-            // Draw the texts
+            // Draw labels (background + border on top of everything)
+            u.texturize = 0;
+            u.notex_color = Rgba::new(0.75, 0.75, 0.75, 1.0);
+            gl_fixs.prg_paper_solid.draw(
+                &u,
+                &self.data.gl_objs().paper_vertices_label,
+                glow::TRIANGLES,
+            );
+            gl_fixs.prg_paper_line.draw(
+                &u,
+                &self.data.gl_objs().paper_vertices_label_border,
+                glow::TRIANGLES,
+            );
+
+            // Draw label thumbnail texture (3D preview inside the label)
+            if let Some(tex) = &self.data.gl_objs().label_thumbnail_tex {
+                self.gl.active_texture(glow::TEXTURE0);
+                self.gl
+                    .bind_texture(glow::TEXTURE_2D, Some(tex.id()));
+                // prg_label_color uses the same m/tex uniforms as Uniforms2D; extras are ignored
+                gl_fixs.prg_label_color.draw(
+                    &u,
+                    &self.data.gl_objs().paper_vertices_label_thumb,
+                    glow::TRIANGLES,
+                );
+                self.gl.bind_texture(glow::TEXTURE_2D, None);
+            }
+
+            // Draw the texts (island names, edge ids, label titles)
             if self.data.ui.show_texts {
                 self.gl.active_texture(glow::TEXTURE0);
                 for (ut, pt) in &self.data.gl_objs().paper_text {
@@ -3209,6 +3327,92 @@ impl GlobalContext {
             );
             pixbuf
         }
+    }
+
+    fn create_label_thumbnail(&mut self) {
+        use cgmath::Quaternion;
+        const W: i32 = 256;
+        const H: i32 = 256;
+        type V3 = cgmath::Vector3<f32>;
+
+        let fbo = glr::Framebuffer::generate(&self.gl).unwrap();
+        let tex = glr::Texture::generate(&self.gl).unwrap();
+        let rboz = glr::Renderbuffer::generate(&self.gl).unwrap();
+
+        unsafe {
+            // Set up texture as color attachment
+            self.gl
+                .bind_texture(glow::TEXTURE_2D, Some(tex.id()));
+            self.gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                W,
+                H,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            self.gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::LINEAR as i32,
+            );
+            self.gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::LINEAR as i32,
+            );
+            self.gl.bind_texture(glow::TEXTURE_2D, None);
+
+            let fb_binder = BinderFramebuffer::bind(&fbo);
+            self.gl.framebuffer_texture_2d(
+                fb_binder.target(),
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(tex.id()),
+                0,
+            );
+
+            let rb_binder = BinderRenderbuffer::bind(&rboz);
+            self.gl
+                .renderbuffer_storage(rb_binder.target(), glow::DEPTH_COMPONENT, W, H);
+            self.gl.framebuffer_renderbuffer(
+                fb_binder.target(),
+                glow::DEPTH_ATTACHMENT,
+                glow::RENDERBUFFER,
+                Some(rboz.id()),
+            );
+            drop(rb_binder);
+
+            // 3/4 front-left angle: Y -30°, X 20°
+            let thumb_data = self
+                .data
+                .prepare_thumbnail(Vector2::new(W as f32, H as f32));
+            let rot_y = Quaternion::from_axis_angle(V3::new(0.0, 1.0, 0.0), cgmath::Deg(-30.0_f32));
+            let rot_x = Quaternion::from_axis_angle(V3::new(1.0, 0.0, 0.0), cgmath::Deg(20.0_f32));
+            self.data.ui.trans_scene.rotation = (rot_y * rot_x).normalize();
+            self.data.ui.trans_scene.recompute_obj();
+
+            // Flip Y so the image is upright when used as a texture
+            self.data.ui.trans_scene.persp.y.y *= -1.0;
+            self.gl.front_face(glow::CW);
+
+            self.data.pre_render(RebuildFlags::all(), &TextBuilderDummy);
+            self.gl.viewport(0, 0, W, H);
+            self.gl.clear_color(0.95, 0.95, 0.95, 1.0);
+            self.gl.clear_depth_f32(1.0);
+            self.gl
+                .clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
+            self.render_scene(1.0);
+
+            self.gl.front_face(glow::CCW);
+            self.data.restore_thumbnail(thumb_data);
+        }
+
+        self.data.set_label_thumbnail(tex);
+        self.add_rebuild(RebuildFlags::all());
     }
 
     fn generate_3d_pdf_views(&mut self, file_name: &Path) -> Result<()> {

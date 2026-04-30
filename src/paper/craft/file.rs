@@ -287,6 +287,7 @@ impl Papercraft {
             options,
             edges,
             islands,
+            labels: SlotMap::with_key(),
             memo: Memoization::default(),
             edge_ids: Vec::new(),
         };

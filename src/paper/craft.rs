@@ -112,6 +112,35 @@ pub enum EdgeIdPosition {
 
 new_key_type! {
     pub struct IslandKey;
+    pub struct LabelKey;
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Label {
+    #[serde(with = "super::ser::vector2")]
+    pub pos: Vector2,
+    #[serde(with = "super::ser::vector2")]
+    pub size: Vector2,
+    pub title: String,
+}
+
+impl Label {
+    pub fn new(pos: Vector2, title: String) -> Label {
+        Label {
+            pos,
+            size: Vector2::new(60.0, 50.0),
+            title,
+        }
+    }
+    pub fn title_height() -> f32 {
+        10.0
+    }
+    pub fn contains(&self, p: Vector2) -> bool {
+        p.x >= self.pos.x
+            && p.x <= self.pos.x + self.size.x
+            && p.y >= self.pos.y
+            && p.y <= self.pos.y + self.size.y
+    }
 }
 
 // If we need an IslandKey, but we need to survive joins/cuts.
@@ -424,6 +453,9 @@ pub struct Papercraft {
     #[serde(with = "super::ser::slot_map")]
     islands: SlotMap<IslandKey, Island>,
 
+    #[serde(default, with = "super::ser::slot_map")]
+    labels: SlotMap<LabelKey, Label>,
+
     #[serde(skip)]
     memo: Memoization,
     #[serde(skip)]
@@ -524,6 +556,7 @@ impl Papercraft {
             options: PaperOptions::default(),
             edges: Vec::new(),
             islands: SlotMap::with_key(),
+            labels: SlotMap::with_key(),
             memo: Memoization::default(),
             edge_ids: Vec::new(),
         }
@@ -589,6 +622,28 @@ impl Papercraft {
     }
     pub fn num_islands(&self) -> usize {
         self.islands.len()
+    }
+
+    pub fn labels(&self) -> impl Iterator<Item = (LabelKey, &Label)> + '_ {
+        self.labels.iter()
+    }
+    pub fn add_label(&mut self, label: Label) -> LabelKey {
+        self.labels.insert(label)
+    }
+    pub fn remove_label(&mut self, key: LabelKey) {
+        self.labels.remove(key);
+    }
+    pub fn label_by_key(&self, key: LabelKey) -> Option<&Label> {
+        self.labels.get(key)
+    }
+    pub fn label_by_key_mut(&mut self, key: LabelKey) -> Option<&mut Label> {
+        self.labels.get_mut(key)
+    }
+    pub fn label_at(&self, pos: Vector2) -> Option<LabelKey> {
+        self.labels
+            .iter()
+            .find(|(_, l)| l.contains(pos))
+            .map(|(k, _)| k)
     }
     pub fn island_bounding_box_angle(
         &self,
