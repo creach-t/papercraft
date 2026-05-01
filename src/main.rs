@@ -57,15 +57,15 @@ const KARLA_TTF: &[u8] = include_bytes!("Karla-Regular.ttf");
 const FONT_SIZE: f32 = 3.0;
 
 use paper::{
-    EdgeIdPosition, FlapStyle, FoldStyle, IslandKey, PaperOptions, Papercraft,
-    import::import_model_file,
+    EdgeIdPosition, FlapStyle, FoldStyle, IslandKey, Label, PaperOptions, Papercraft,
+    formats::{export_model_file, import_model_file},
 };
 use util_3d::Matrix3;
 use util_gl::{UniformQuad, Uniforms2D, Uniforms3D};
 
 use clap::Parser;
 
-use crate::paper::LineConfig;
+use crate::{paper::LineConfig, util_3d::TotalF32};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -243,6 +243,7 @@ impl easy_imgui_window::Application for Box<GlobalContext> {
             title: String::new(),
             textures_to_delete: Vec::new(),
             proxy: local_proxy,
+            label_title_buf: String::new(),
         };
         let mut ctx = Box::new(ctx);
         ctx.build_fonts(imgui.io_mut().font_atlas_mut());
@@ -337,6 +338,9 @@ fn build_gl_fixs(gl: &GlContext) -> Result<GLFixedObjects> {
         .with_context(|| "quad")?;
     let prg_text = util_gl::program_from_source(gl, include_str!("shaders/text.glsl"))
         .with_context(|| "text")?;
+    let prg_label_color =
+        util_gl::program_from_source(gl, include_str!("shaders/label_color.glsl"))
+            .with_context(|| "label_color")?;
 
     let vao = glr::VertexArray::generate(gl)?;
 
@@ -409,6 +413,7 @@ fn build_gl_fixs(gl: &GlContext) -> Result<GLFixedObjects> {
         prg_paper_line,
         prg_quad,
         prg_text,
+        prg_label_color,
     })
 }
 
@@ -429,6 +434,7 @@ struct GLFixedObjects {
     prg_paper_line: glr::Program,
     prg_quad: glr::Program,
     prg_text: glr::Program,
+    prg_label_color: glr::Program,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -440,6 +446,7 @@ enum FileAction {
     UpdateObj,
     ExportObj,
     GeneratePrintable,
+    Generate3dPdf,
 }
 
 impl FileAction {
@@ -451,6 +458,7 @@ impl FileAction {
             FileAction::UpdateObj => tr!("Updating..."),
             FileAction::ExportObj => tr!("Exporting..."),
             FileAction::GeneratePrintable => tr!("Generating..."),
+            FileAction::Generate3dPdf => tr!("Generating 3D PDF..."),
         }
     }
     fn is_save(&self) -> bool {
@@ -459,7 +467,7 @@ impl FileAction {
             | FileAction::OpenCraftReadOnly
             | FileAction::ImportModel
             | FileAction::UpdateObj => false,
-            FileAction::SaveAsCraft | FileAction::ExportObj | FileAction::GeneratePrintable => true,
+            FileAction::SaveAsCraft | FileAction::ExportObj | FileAction::GeneratePrintable | FileAction::Generate3dPdf => true,
         }
     }
 }
@@ -551,6 +559,8 @@ struct GlobalContext {
     // If a texture is added to a window-list, but then deleted, it should be kept alive until after the render.
     textures_to_delete: Vec<glr::Texture>,
     proxy: LocalProxy<Box<GlobalContext>>,
+    // Buffer for editing label titles inline
+    label_title_buf: String,
 }
 
 struct FileDialog {
@@ -682,11 +692,13 @@ enum BoolWithConfirm {
 struct MenuActions {
     open: BoolWithConfirm,
     save: bool,
+    add_label: bool,
     save_as: bool,
     import_model: BoolWithConfirm,
     update_model: BoolWithConfirm,
     export_obj: bool,
     generate_printable: bool,
+    generate_3d_pdf: bool,
     quit: BoolWithConfirm,
     reset_views: bool,
     undo: bool,
@@ -885,6 +897,54 @@ impl GlobalContext {
                 });
                 //TODO: list third party SW
             });
+    }
+
+    fn build_label_editor(&mut self, ui: &Ui) {
+        let Some(key) = self.data.selected_label else {
+            return;
+        };
+        let Some(label) = self.data.papercraft().label_by_key(key) else {
+            // Label was removed; deselect
+            self.data.selected_label = None;
+            return;
+        };
+
+        // Sync the edit buffer when selection changes
+        if self.label_title_buf != label.title {
+            self.label_title_buf = label.title.clone();
+        }
+
+        let mut open = true;
+        ui.window_config(lbl_id(tr!("Label"), "label_editor"))
+            .open(&mut open)
+            .flags(imgui::WindowFlags::AlwaysAutoResize | imgui::WindowFlags::NoCollapse)
+            .with(|| {
+                ui.align_text_to_frame_padding();
+                ui.text(&tr!("Title:"));
+                ui.same_line();
+                let changed = ui
+                    .input_text_config(lbl_id("", "label_title"), &mut self.label_title_buf)
+                    .build();
+                if changed {
+                    if let Some(label_mut) = self.data.papercraft_mut().label_by_key_mut(key) {
+                        label_mut.title = self.label_title_buf.clone();
+                        self.data.modified = true;
+                    }
+                    self.add_rebuild(RebuildFlags::PAPER);
+                }
+
+                ui.separator();
+                if ui.button(lbl(tr!("Delete label"))) {
+                    self.data.papercraft_mut().remove_label(key);
+                    self.data.selected_label = None;
+                    self.data.modified = true;
+                    self.add_rebuild(RebuildFlags::PAPER);
+                }
+            });
+
+        if !open {
+            self.data.selected_label = None;
+        }
     }
 
     fn new_version_result(&mut self, version: Result<(Version, String)>) {
@@ -1118,6 +1178,7 @@ impl GlobalContext {
         self.build_modal_file_action(ui);
         self.build_confirm_message(ui, &mut menu_actions);
         self.build_about(ui);
+        self.build_label_editor(ui);
 
         menu_actions
     }
@@ -1901,6 +1962,12 @@ impl GlobalContext {
                 {
                     menu_actions.generate_printable = true;
                 }
+                if ui
+                    .menu_item_config(lbl(tr!("Export 3D Views PDF...")))
+                    .build()
+                {
+                    menu_actions.generate_3d_pdf = true;
+                }
                 ui.separator();
                 if ui
                     .menu_item_config(lbl(tr!("Settings...")))
@@ -1980,6 +2047,11 @@ impl GlobalContext {
                         let undo = self.data.pack_islands();
                         self.data.push_undo_action(undo);
                         self.add_rebuild(RebuildFlags::PAPER | RebuildFlags::SELECTION);
+                    }
+
+                    ui.separator();
+                    if ui.menu_item_config(lbl(tr!("Add label"))).build() {
+                        menu_actions.add_label = true;
                     }
                 }
             });
@@ -2301,6 +2373,35 @@ impl GlobalContext {
         if menu_actions.reset_views {
             self.data.reset_views(self.sz_scene, self.sz_paper);
         }
+        if menu_actions.add_label {
+            // Place the label at the top of page 1, spanning the usable width
+            let options = self.data.papercraft().options();
+            let page_pos = options.page_position(0);
+            let page_size = Vector2::from(options.page_size);
+            let (margin_top, margin_left, margin_right, _) = options.margin;
+            let usable_w = page_size.x - margin_left - margin_right;
+            let label_size = Vector2::new(usable_w, 70.0);
+            let pos = Vector2::new(page_pos.x + margin_left, page_pos.y + margin_top);
+            let model_name = self
+                .file_name
+                .as_deref()
+                .and_then(|p| p.file_stem())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| tr!("Label"));
+            let key = self.data.papercraft_mut().add_label(Label {
+                pos,
+                size: label_size,
+                title: model_name.clone(),
+            });
+            self.data.selected_label = Some(key);
+            self.label_title_buf = model_name;
+            // Ensure the thumbnail texture exists; create it now if not
+            if self.data.gl_objs().label_thumbnail_tex.is_none() {
+                self.create_label_thumbnail();
+            }
+            self.data.modified = true;
+            self.add_rebuild(RebuildFlags::PAPER);
+        }
         if menu_actions.undo {
             match self.data.undo_action() {
                 UndoResult::Model => {
@@ -2457,6 +2558,18 @@ impl GlobalContext {
                 chooser,
                 tr!("Generate Printable..."),
                 FileAction::GeneratePrintable,
+            ));
+            open_file_dialog = true;
+        }
+        if menu_actions.generate_3d_pdf {
+            let mut chooser = filechooser::FileChooser::new();
+            let _ = chooser.set_path(&self.last_path);
+            chooser.add_filter(filters::pdf());
+            chooser.add_filter(filters::all_files());
+            self.file_dialog = Some(FileDialog::new(
+                chooser,
+                tr!("Export 3D Views PDF..."),
+                FileAction::Generate3dPdf,
             ));
             open_file_dialog = true;
         }
@@ -2657,7 +2770,7 @@ impl GlobalContext {
                 .scene_button2_click_event(self.sz_scene, mouse_pos),
             Canvas3dAction::DoubleClicked(MouseButton::Left) => self
                 .data
-                .scene_button1_dblclick_event(self.sz_scene, mouse_pos),
+                .scene_button1_dblclick_event(self.sz_scene, mouse_pos, mods),
             Canvas3dAction::Released(MouseButton::Left) => {
                 self.data
                     .scene_button1_release_event(self.sz_scene, mouse_pos, mods)
@@ -2951,7 +3064,51 @@ impl GlobalContext {
 
             self.gl.disable(glow::STENCIL_TEST);
 
-            // Draw the texts
+            // Draw labels (background + border on top of everything)
+            u.texturize = 0;
+            u.notex_color = Rgba::new(0.75, 0.75, 0.75, 1.0);
+            gl_fixs.prg_paper_solid.draw(
+                &u,
+                &self.data.gl_objs().paper_vertices_label,
+                glow::TRIANGLES,
+            );
+            gl_fixs.prg_paper_line.draw(
+                &u,
+                &self.data.gl_objs().paper_vertices_label_border,
+                glow::TRIANGLES,
+            );
+
+            // Draw label thumbnail texture (3D preview inside the label)
+            if let Some(tex) = &self.data.gl_objs().label_thumbnail_tex {
+                self.gl.active_texture(glow::TEXTURE0);
+                self.gl
+                    .bind_texture(glow::TEXTURE_2D, Some(tex.id()));
+                // prg_label_color uses the same m/tex uniforms as Uniforms2D; extras are ignored
+                gl_fixs.prg_label_color.draw(
+                    &u,
+                    &self.data.gl_objs().paper_vertices_label_thumb,
+                    glow::TRIANGLES,
+                );
+                self.gl.bind_texture(glow::TEXTURE_2D, None);
+            }
+
+            // Label titles always visible (not gated by show_texts)
+            self.gl.active_texture(glow::TEXTURE0);
+            for (ut, pt) in &self.data.gl_objs().paper_label_text {
+                self.gl.bind_texture(
+                    glow::TEXTURE_2D,
+                    Renderer::unmap_tex(
+                        imgui
+                            .io()
+                            .font_atlas()
+                            .get_texture_by_unique_id(*ut)
+                            .unwrap(),
+                    ),
+                );
+                gl_fixs.prg_text.draw(&u, pt, glow::TRIANGLES);
+            }
+
+            // Draw the texts (island names, edge ids)
             if self.data.ui.show_texts {
                 self.gl.active_texture(glow::TEXTURE0);
                 for (ut, pt) in &self.data.gl_objs().paper_text {
@@ -3052,6 +3209,9 @@ impl GlobalContext {
             FileAction::GeneratePrintable => {
                 self.generate_printable(imgui, file_name, action.file_format)?;
             }
+            FileAction::Generate3dPdf => {
+                self.generate_3d_pdf_views(file_name)?;
+            }
         }
         Ok(())
     }
@@ -3067,6 +3227,10 @@ impl GlobalContext {
             *o = self.data.papercraft().options().clone();
         }
         self.rebuild = RebuildFlags::all();
+        // Regenerate label thumbnail for any labels that were loaded
+        if self.data.papercraft().labels().next().is_some() {
+            self.create_label_thumbnail();
+        }
         Ok(())
     }
     fn create_thumbnail(&mut self) -> image::RgbaImage {
@@ -3187,6 +3351,441 @@ impl GlobalContext {
         }
     }
 
+    fn create_label_thumbnail(&mut self) {
+        use cgmath::Quaternion;
+        const W: i32 = 256;
+        const H: i32 = 256;
+        type V3 = cgmath::Vector3<f32>;
+
+        let fbo = glr::Framebuffer::generate(&self.gl).unwrap();
+        let tex = glr::Texture::generate(&self.gl).unwrap();
+        let rboz = glr::Renderbuffer::generate(&self.gl).unwrap();
+
+        unsafe {
+            // Set up texture as color attachment
+            self.gl
+                .bind_texture(glow::TEXTURE_2D, Some(tex.id()));
+            self.gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                W,
+                H,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            self.gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::LINEAR as i32,
+            );
+            self.gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::LINEAR as i32,
+            );
+            self.gl.bind_texture(glow::TEXTURE_2D, None);
+
+            let fb_binder = BinderFramebuffer::bind(&fbo);
+            self.gl.framebuffer_texture_2d(
+                fb_binder.target(),
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(tex.id()),
+                0,
+            );
+
+            let rb_binder = BinderRenderbuffer::bind(&rboz);
+            self.gl
+                .renderbuffer_storage(rb_binder.target(), glow::DEPTH_COMPONENT, W, H);
+            self.gl.framebuffer_renderbuffer(
+                fb_binder.target(),
+                glow::DEPTH_ATTACHMENT,
+                glow::RENDERBUFFER,
+                Some(rboz.id()),
+            );
+            drop(rb_binder);
+
+            // 3/4 front-left angle: Y -30°, X 20°
+            let thumb_data = self
+                .data
+                .prepare_thumbnail(Vector2::new(W as f32, H as f32));
+            let rot_y = Quaternion::from_axis_angle(V3::new(0.0, 1.0, 0.0), cgmath::Deg(-30.0_f32));
+            let rot_x = Quaternion::from_axis_angle(V3::new(1.0, 0.0, 0.0), cgmath::Deg(20.0_f32));
+            self.data.ui.trans_scene.rotation = (rot_y * rot_x).normalize();
+
+            // Perspective-correct tight-fit: scale so the model fills ~90% of the thumbnail.
+            // Same formula as generate_3d_pdf_views: S = fill*dist / (|rv.proj|*focal + fill*rv.z)
+            {
+                use cgmath::Matrix3;
+                const FILL: f32 = 0.90;
+                let obj_mat = self.data.ui.trans_scene.obj;
+                let rot_mat = Matrix3::from(self.data.ui.trans_scene.rotation);
+                let focal = self.data.ui.trans_scene.persp[1][1];
+                let camera_dist = -self.data.ui.trans_scene.location.z;
+                let tight_scale = self
+                    .data
+                    .papercraft()
+                    .model()
+                    .vertices()
+                    .fold(f32::INFINITY, |min_s, (_, v)| {
+                        use cgmath::Transform;
+                        let p = v.pos();
+                        let nv = obj_mat
+                            .transform_point(cgmath::Point3::new(p.x, p.y, p.z))
+                            .to_vec();
+                        let rv = rot_mat * nv;
+                        let lim = |proj: f32| {
+                            let d = proj.abs() * focal + FILL * rv.z;
+                            if d > 0.0 { FILL * camera_dist / d } else { f32::INFINITY }
+                        };
+                        min_s.min(lim(rv.x)).min(lim(rv.y))
+                    });
+                if tight_scale.is_finite() && tight_scale > 0.0 {
+                    self.data.ui.trans_scene.scale = tight_scale;
+                }
+            }
+            self.data.ui.trans_scene.recompute_obj();
+
+            // Flip Y so the image is upright when used as a texture
+            self.data.ui.trans_scene.persp.y.y *= -1.0;
+            self.gl.front_face(glow::CW);
+
+            self.data.pre_render(RebuildFlags::all(), &TextBuilderDummy);
+            self.gl.viewport(0, 0, W, H);
+            // Transparent background — the model composites over the white page behind it
+            self.gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            self.gl.clear_depth_f32(1.0);
+            self.gl
+                .clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
+            self.render_scene(1.0);
+
+            self.gl.front_face(glow::CCW);
+            self.data.restore_thumbnail(thumb_data);
+        }
+
+        self.data.set_label_thumbnail(tex);
+        self.add_rebuild(RebuildFlags::all());
+    }
+
+    fn generate_3d_pdf_views(&mut self, file_name: &Path) -> Result<()> {
+        use lopdf::{
+            Document, Object, ObjectId, Stream, StringFormat,
+            content::{Content, Operation},
+            dictionary,
+            xref::XrefType,
+        };
+        use cgmath::Quaternion;
+        use rayon::prelude::*;
+
+        const VIEW_SIZE: i32 = 512;
+
+        // (label, rotation_axis_angle: optional (axis_xyz, degrees_f32))
+        type V3 = cgmath::Vector3<f32>;
+        let views: &[(&str, Option<(V3, f32)>)] = &[
+            ("Front",  None),
+            ("Back",   Some((V3::new(0.0, 1.0, 0.0), 180.0_f32))),
+            ("Right",  Some((V3::new(0.0, 1.0, 0.0), -90.0_f32))),
+            ("Left",   Some((V3::new(0.0, 1.0, 0.0),  90.0_f32))),
+            ("Top",    Some((V3::new(1.0, 0.0, 0.0), -90.0_f32))),
+            ("Bottom", Some((V3::new(1.0, 0.0, 0.0),  90.0_f32))),
+        ];
+
+        // Save current state and set up a clean scene
+        let thumb_data = self.data.prepare_thumbnail(
+            Vector2::new(VIEW_SIZE as f32, VIEW_SIZE as f32),
+        );
+        // prepare_thumbnail disables 3d lines (thumbnail use), re-enable to show cut edges
+        self.data.ui.show_3d_lines = true;
+
+        // Pre-compute normalized vertex positions (after obj transform, before rotation/scale)
+        // used for per-view tight-fit auto-scale
+        let obj_mat = self.data.ui.trans_scene.obj;
+        let normalized_verts: Vec<Vector3<f32>> = self.data.papercraft()
+            .model()
+            .vertices()
+            .map(|(_, v)| {
+                use cgmath::Transform;
+                let p = v.pos();
+                obj_mat.transform_point(cgmath::Point3::new(p.x, p.y, p.z)).to_vec()
+            })
+            .collect();
+        // focal = persp[1][1] = 1/tan(FOV/2), camera at z = location.z = -30
+        let focal = self.data.ui.trans_scene.persp[1][1];
+        let camera_dist = -self.data.ui.trans_scene.location.z;
+        let bg = Rgba::new(1.0, 1.0, 1.0, 1.0);
+
+        // Override cut-line colour to blue for the PDF, restore afterwards
+        let orig_cut_color = self.data.papercraft().options().line3d_cut.color;
+        self.data.papercraft_mut().options_mut().line3d_cut.color =
+            imgui::Color::new(0.18, 0.45, 1.0, 1.0);
+
+        let fbo  = glr::Framebuffer::generate(&self.gl)?;
+        let rbo  = glr::Renderbuffer::generate(&self.gl)?;
+        let rboz = glr::Renderbuffer::generate(&self.gl)?;
+
+        let mut view_images: Vec<(&str, image::RgbaImage)> = Vec::new();
+
+        unsafe {
+            let fb_binder = BinderFramebuffer::bind(&fbo);
+
+            let rb_binder = glr::BinderRenderbuffer::bind(&rbo);
+            self.gl.renderbuffer_storage(rb_binder.target(), glow::RGBA8, VIEW_SIZE, VIEW_SIZE);
+            self.gl.framebuffer_renderbuffer(
+                fb_binder.target(), glow::COLOR_ATTACHMENT0,
+                glow::RENDERBUFFER, Some(rbo.id()),
+            );
+            rb_binder.rebind(&rboz);
+            self.gl.renderbuffer_storage(rb_binder.target(), glow::DEPTH_COMPONENT, VIEW_SIZE, VIEW_SIZE);
+            self.gl.framebuffer_renderbuffer(
+                fb_binder.target(), glow::DEPTH_ATTACHMENT,
+                glow::RENDERBUFFER, Some(rboz.id()),
+            );
+
+            // Flip Y so the captured image is right-side up (same trick as create_thumbnail)
+            self.data.ui.trans_scene.persp.y.y *= -1.0;
+            self.gl.front_face(glow::CW);
+
+            // pre_render builds edge-status buffer — must happen AFTER colour override above
+            self.data.pre_render(RebuildFlags::all(), &TextBuilderDummy);
+            self.gl.viewport(0, 0, VIEW_SIZE, VIEW_SIZE);
+
+            self.gl.enable(glow::DEPTH_TEST);
+            self.gl.depth_func(glow::LEQUAL);
+            self.gl.enable(glow::BLEND);
+            self.gl.blend_func_separate(
+                glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA,
+                glow::ONE,       glow::ONE_MINUS_SRC_ALPHA,
+            );
+
+            for &(label, ref rotation) in views.iter() {
+                self.data.ui.trans_scene.rotation = match rotation {
+                    None => Quaternion::one(),
+                    Some((axis, angle)) => Quaternion::from_axis_angle(*axis, Deg(*angle)),
+                };
+
+                // Exact perspective-correct tight-fit scale for this view.
+                // For each vertex v in normalized space, the clip-x at scale S is:
+                //   clip_x = rv.x * S / (camera_dist - rv.z * S) * focal
+                // Solving for S where |clip_x| = fill gives:
+                //   S = fill * camera_dist / (|rv.x| * focal + fill * rv.z)
+                // We take the minimum over all vertices (most constraining).
+                {
+                    use cgmath::Matrix3;
+                    const FILL: f32 = 0.92;
+                    let rot_mat = Matrix3::from(self.data.ui.trans_scene.rotation);
+                    let tight_scale = normalized_verts.iter()
+                        .fold(f32::INFINITY, |min_s, v| {
+                            let rv = rot_mat * *v;
+                            let lim = |proj: f32| {
+                                let d = proj.abs() * focal + FILL * rv.z;
+                                if d > 0.0 { FILL * camera_dist / d } else { f32::INFINITY }
+                            };
+                            min_s.min(lim(rv.x)).min(lim(rv.y))
+                        });
+                    if tight_scale.is_finite() && tight_scale > 0.0 {
+                        self.data.ui.trans_scene.scale = tight_scale;
+                    }
+                }
+                self.data.ui.trans_scene.recompute_obj();
+
+                self.gl.clear_color(bg.r, bg.g, bg.b, bg.a);
+                self.gl.clear_depth_f32(1.0);
+                self.gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
+
+                self.render_scene(1.0);
+
+                self.gl.read_buffer(glow::COLOR_ATTACHMENT0);
+                self.gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+                let mut pixbuf = image::RgbaImage::new(VIEW_SIZE as u32, VIEW_SIZE as u32);
+                self.gl.read_pixels(
+                    0, 0, VIEW_SIZE, VIEW_SIZE,
+                    glow::RGBA, glow::UNSIGNED_BYTE,
+                    glow::PixelPackData::Slice(Some(&mut pixbuf)),
+                );
+                view_images.push((label, pixbuf));
+            }
+
+            self.gl.front_face(glow::CCW);
+        }
+
+        self.data.restore_thumbnail(thumb_data);
+        // Restore cut-line colour that was overridden for the PDF
+        self.data.papercraft_mut().options_mut().line3d_cut.color = orig_cut_color;
+        self.add_rebuild(RebuildFlags::all());
+
+        // --- Build PDF ---
+        // A4 landscape: 297 × 210 mm  →  points (72 pt/inch)
+        let page_w = 297.0_f32 * 72.0 / 25.4;
+        let page_h = 210.0_f32 * 72.0 / 25.4;
+        let margin  = 18.0_f32;
+        let gap     = 8.0_f32;
+        let title_h = 22.0_f32;
+        let cols    = 3_usize;
+        let rows    = 2_usize;
+
+        let view_w = (page_w - 2.0 * margin - (cols - 1) as f32 * gap) / cols as f32;
+        let view_h = (page_h - 2.0 * margin - title_h - (rows - 1) as f32 * gap) / rows as f32;
+        let cell_h  = view_h.min(view_w);       // square views
+        let actual_view_w = cell_h;              // keep them square
+
+        let mut doc = Document::with_version("1.4");
+        doc.reference_table.cross_reference_type = XrefType::CrossReferenceTable;
+
+        let id_pages = doc.new_object_id();
+        let id_font  = doc.add_object(dictionary! {
+            "Type"     => "Font",
+            "Subtype"  => "Type1",
+            "BaseFont" => "Helvetica",
+            "Encoding" => "WinAnsiEncoding",
+        });
+
+        // Pre-allocate image object IDs
+        let id_pairs: Vec<(ObjectId, ObjectId)> = (0..view_images.len())
+            .map(|_| (doc.new_object_id(), doc.new_object_id()))
+            .collect();
+
+        // Parallel compression (same pattern as generate_pdf)
+        let (tx_compress, rx_compress) =
+            std::sync::mpsc::channel::<(ObjectId, ObjectId, image::RgbaImage)>();
+        let (tx_done, rx_done) = std::sync::mpsc::channel::<(ObjectId, Stream)>();
+        rayon::spawn(move || {
+            rx_compress
+                .into_iter()
+                .par_bridge()
+                .flat_map(|(id_mask, id_img, pixbuf)| {
+                    let (w, h) = pixbuf.dimensions();
+                    let mut rgb   = vec![0u8; (3 * w * h) as usize];
+                    let mut alpha = vec![0u8; (w * h) as usize];
+                    for (n, px) in pixbuf.pixels().enumerate() {
+                        let c = px.channels();
+                        rgb[3 * n..][..3].copy_from_slice(&c[..3]);
+                        alpha[n] = c[3];
+                    }
+                    let s_mask = Stream::new(dictionary! {
+                        "Type" => "XObject", "Subtype" => "Image",
+                        "Width" => w, "Height" => h,
+                        "BitsPerComponent" => 8, "ColorSpace" => "DeviceGray",
+                    }, alpha);
+                    let s_img = Stream::new(dictionary! {
+                        "Type" => "XObject", "Subtype" => "Image",
+                        "Width" => w, "Height" => h,
+                        "BitsPerComponent" => 8, "ColorSpace" => "DeviceRGB",
+                        "SMask" => id_mask,
+                    }, rgb);
+                    [(id_mask, s_mask), (id_img, s_img)]
+                })
+                .for_each(|(id, mut s)| {
+                    let _ = s.compress();
+                    tx_done.send((id, s)).unwrap();
+                });
+            drop(tx_done);
+        });
+
+        // Build page content ops
+        let mut ops: Vec<Operation> = Vec::new();
+        let mut xobj_names: Vec<(String, ObjectId)> = Vec::new();
+
+        // Title
+        let title_text = self.title(false);
+        ops.push(Operation::new("BT", vec![]));
+        ops.push(Operation::new("Tf", vec!["F1".into(), 14.0_f32.into()]));
+        ops.push(Operation::new("Tm", vec![
+            1.0_f32.into(), 0.0_f32.into(), 0.0_f32.into(), 1.0_f32.into(),
+            margin.into(), (page_h - margin - 14.0_f32).into(),
+        ]));
+        ops.push(Operation::new("Tj", vec![
+            Object::String(title_text.into_bytes(), StringFormat::Literal),
+        ]));
+        ops.push(Operation::new("ET", vec![]));
+
+        for (i, ((_label, pixbuf), (id_mask, id_img))) in
+            view_images.iter().zip(id_pairs.iter()).enumerate()
+        {
+            let col = i % cols;
+            let row = i / cols;
+
+            // X: distribute 3 columns
+            let x = margin + col as f32 * (actual_view_w + gap);
+            // Y from top: title + row * (view + gap)
+            let top_offset = margin + title_h + row as f32 * (cell_h + gap);
+            let y = page_h - top_offset - cell_h;
+
+            let img_name = format!("IMG{i}");
+
+            // Draw image
+            ops.push(Operation::new("q", vec![]));
+            ops.push(Operation::new("cm", vec![
+                actual_view_w.into(), 0.0_f32.into(), 0.0_f32.into(), cell_h.into(),
+                x.into(), y.into(),
+            ]));
+            ops.push(Operation::new("Do", vec![img_name.clone().into()]));
+            ops.push(Operation::new("Q", vec![]));
+
+            // Border
+            ops.push(Operation::new("w", vec![0.4_f32.into()]));
+            ops.push(Operation::new("RG", vec![0.6_f32.into(), 0.6_f32.into(), 0.6_f32.into()]));
+            ops.push(Operation::new("re", vec![x.into(), y.into(), actual_view_w.into(), cell_h.into()]));
+            ops.push(Operation::new("S", vec![]));
+
+            xobj_names.push((img_name, *id_img));
+            tx_compress.send((*id_mask, *id_img, pixbuf.clone())).unwrap();
+        }
+        drop(tx_compress);
+
+        for (id, stream) in rx_done.into_iter() {
+            doc.set_object(id, stream);
+        }
+
+        let content = Content { operations: ops };
+        let id_content = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+
+        let mut xobj_dict = lopdf::Dictionary::new();
+        for (name, id) in xobj_names {
+            xobj_dict.set(name, Object::Reference(id));
+        }
+
+        let id_resources = doc.add_object(dictionary! {
+            "Font"    => dictionary! { "F1" => id_font },
+            "XObject" => Object::Dictionary(xobj_dict),
+        });
+
+        let id_page = doc.add_object(dictionary! {
+            "Type"     => "Page",
+            "Parent"   => id_pages,
+            "MediaBox" => vec![0i32.into(), 0i32.into(), page_w.into(), page_h.into()],
+            "Contents" => id_content,
+            "Resources"=> id_resources,
+        });
+
+        let pdf_pages = dictionary! {
+            "Type"  => "Pages",
+            "Count" => 1i32,
+            "Kids"  => vec![id_page.into()],
+        };
+        doc.set_object(id_pages, pdf_pages);
+
+        let id_catalog = doc.add_object(dictionary! {
+            "Type"  => "Catalog",
+            "Pages" => id_pages,
+        });
+        doc.trailer.set("Root", id_catalog);
+
+        let id_info = doc.add_object(dictionary! {
+            "Title"   => Object::string_literal(self.title(false)),
+            "Creator" => Object::string_literal(signature()),
+        });
+        doc.trailer.set("Info", id_info);
+
+        doc.compress();
+        doc.save(file_name)
+            .with_context(|| tr!("Error saving file {}", file_name.display()))?;
+
+        Ok(())
+    }
+
     fn save_as_craft(&self, file_name: &Path, thumbnail: Option<image::RgbaImage>) -> Result<()> {
         let f = std::fs::File::create(file_name)
             .with_context(|| tr!("Error creating file {}", file_name.display()))?;
@@ -3223,10 +3822,9 @@ impl GlobalContext {
         self.data.modified = true;
         Ok(())
     }
+
     fn export_obj(&self, file_name: &Path) -> Result<()> {
-        self.data
-            .papercraft()
-            .export_waveobj(file_name.as_ref())
+        export_model_file(self.data.papercraft(), file_name)
             .with_context(|| tr!("Error exporting to {}", file_name.display()))?;
         Ok(())
     }
@@ -3370,11 +3968,10 @@ fn demultiply_image(img: &mut image::RgbaImage) {
     for p in img.pixels_mut() {
         let a = p.0[3] as u32;
         for i in &mut p.0[0..3] {
-            *i = if a == 0 {
-                0
-            } else {
-                (*i as u32 * 255 / a).clamp(0, 255) as u8
-            };
+            *i = (*i as u32 * 255)
+                .checked_div(a)
+                .map(|d| d.clamp(0, 255) as u8)
+                .unwrap_or(0);
         }
     }
 }
@@ -3517,7 +4114,7 @@ pub fn cut_to_contour(mut cuts: Vec<(Vector2, Vector2)>) -> Vec<Vector2> {
             .iter()
             .enumerate()
             .map(|(idx, (v0, _))| (idx, v0.distance2(p.1)))
-            .min_by(|(_, a), (_, b)| f32::total_cmp(a, b))
+            .min_by_key(|(_, a)| TotalF32(*a))
         {
             p = cuts.swap_remove(next);
             res.push(p.0);

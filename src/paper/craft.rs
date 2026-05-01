@@ -67,10 +67,19 @@ impl FlapSide {
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum RealEdgeStatus {
+    Hidden,
+    Joined,
+    Cut(FlapSide),
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum EdgeStatus {
     Hidden,
     Joined,
     Cut(FlapSide),
+    /// Is joined, but actually hidden because of hidden_line_angle
+    SoftHidden,
 }
 
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
@@ -103,6 +112,25 @@ pub enum EdgeIdPosition {
 
 new_key_type! {
     pub struct IslandKey;
+    pub struct LabelKey;
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Label {
+    #[serde(with = "super::ser::vector2")]
+    pub pos: Vector2,
+    #[serde(with = "super::ser::vector2")]
+    pub size: Vector2,
+    pub title: String,
+}
+
+impl Label {
+    pub fn contains(&self, p: Vector2) -> bool {
+        p.x >= self.pos.x
+            && p.x <= self.pos.x + self.size.x
+            && p.y >= self.pos.y
+            && p.y <= self.pos.y + self.size.y
+    }
 }
 
 // If we need an IslandKey, but we need to survive joins/cuts.
@@ -411,9 +439,12 @@ pub struct Papercraft {
     model: Model,
     #[serde(default)] //TODO: default not actually needed
     options: PaperOptions,
-    edges: Vec<EdgeStatus>, //parallel to EdgeIndex
+    edges: Vec<RealEdgeStatus>, //parallel to EdgeIndex
     #[serde(with = "super::ser::slot_map")]
     islands: SlotMap<IslandKey, Island>,
+
+    #[serde(default, with = "super::ser::slot_map")]
+    labels: SlotMap<LabelKey, Label>,
 
     #[serde(skip)]
     memo: Memoization,
@@ -515,6 +546,7 @@ impl Papercraft {
             options: PaperOptions::default(),
             edges: Vec::new(),
             islands: SlotMap::with_key(),
+            labels: SlotMap::with_key(),
             memo: Memoization::default(),
             edge_ids: Vec::new(),
         }
@@ -525,6 +557,9 @@ impl Papercraft {
     }
     pub fn options(&self) -> &PaperOptions {
         &self.options
+    }
+    pub fn options_mut(&mut self) -> &mut PaperOptions {
+        &mut self.options
     }
     // Returns the old options
     pub fn set_options(
@@ -564,14 +599,41 @@ impl Papercraft {
                 }
             }
         }
-
         options
     }
+
+    pub fn should_be_soft_hidden(options: &PaperOptions, edge: &Edge) -> bool {
+        let angle_3d = edge.angle();
+        Rad(angle_3d.0.abs()) < Rad::from(Deg(options.hidden_line_angle))
+    }
+
     pub fn islands(&self) -> impl Iterator<Item = (IslandKey, &Island)> + '_ {
         self.islands.iter()
     }
     pub fn num_islands(&self) -> usize {
         self.islands.len()
+    }
+
+    pub fn labels(&self) -> impl Iterator<Item = (LabelKey, &Label)> + '_ {
+        self.labels.iter()
+    }
+    pub fn add_label(&mut self, label: Label) -> LabelKey {
+        self.labels.insert(label)
+    }
+    pub fn remove_label(&mut self, key: LabelKey) {
+        self.labels.remove(key);
+    }
+    pub fn label_by_key(&self, key: LabelKey) -> Option<&Label> {
+        self.labels.get(key)
+    }
+    pub fn label_by_key_mut(&mut self, key: LabelKey) -> Option<&mut Label> {
+        self.labels.get_mut(key)
+    }
+    pub fn label_at(&self, pos: Vector2) -> Option<LabelKey> {
+        self.labels
+            .iter()
+            .find(|(_, l)| l.contains(pos))
+            .map(|(k, _)| k)
     }
     pub fn island_bounding_box_angle(
         &self,
@@ -658,9 +720,8 @@ impl Papercraft {
 
     pub fn island_is_self_intersecting(&self, island_key: IslandKey) -> bool {
         let perimeter = self.island_perimeter(island_key);
-        let mut edges: Vec<_> = perimeter.into_iter().map(|p| (p.p0, p.p1)).collect();
-        let res = util_3d::self_instersect_polygon(&mut edges);
-        res
+        let mut edges: Vec<_> = perimeter.iter().map(|p| (p.p0, p.p1)).collect();
+        util_3d::self_instersect_polygon(&mut edges)
     }
 
     fn rebuild_island_by_face(&self, memo: &mut Vec<IslandKey>) {
@@ -683,13 +744,13 @@ impl Papercraft {
     }
     pub fn rebuild_island_names(&mut self) {
         // To get somewhat predictable names try to sort the islands before naming them.
-        // For now, sort them by number of faces.
+        // For now, sort them by area.
         let mut islands: Vec<_> = self
             .islands
             .iter()
             .map(|(i_island, island)| (i_island, self.island_area(island)))
             .collect();
-        islands.sort_by(|(_, n1), (_, n2)| n2.total_cmp(n1));
+        islands.sort_by_key(|(_, n)| TotalF32(*n));
 
         // A, B, ... Z, AA, ... AZ, BA, .... ZZ, AAA, AAB, ...
         fn next_name(name: &mut Vec<u8>) {
@@ -712,8 +773,18 @@ impl Papercraft {
         }
     }
 
-    pub fn edge_status(&self, edge: EdgeIndex) -> EdgeStatus {
-        self.edges[usize::from(edge)]
+    pub fn edge_status(&self, i_edge: EdgeIndex) -> EdgeStatus {
+        match self.edges[usize::from(i_edge)] {
+            RealEdgeStatus::Hidden => EdgeStatus::Hidden,
+            RealEdgeStatus::Cut(flap_side) => EdgeStatus::Cut(flap_side),
+            RealEdgeStatus::Joined => {
+                if Self::should_be_soft_hidden(&self.options, &self.model[i_edge]) {
+                    EdgeStatus::SoftHidden
+                } else {
+                    EdgeStatus::Joined
+                }
+            }
+        }
     }
     pub fn edge_id(&self, edge: EdgeIndex) -> Option<EdgeId> {
         if self.options.edge_id_font_size <= 0.0
@@ -730,7 +801,7 @@ impl Papercraft {
         action: EdgeToggleFlapAction,
     ) -> Option<FlapSide> {
         let rim = matches!(self.model()[i_edge].faces(), (_, None));
-        if let EdgeStatus::Cut(ref mut x) = self.edges[usize::from(i_edge)] {
+        if let RealEdgeStatus::Cut(ref mut x) = self.edges[usize::from(i_edge)] {
             Some(std::mem::replace(x, x.apply(action, rim)))
         } else {
             None
@@ -742,8 +813,9 @@ impl Papercraft {
         i_edge: EdgeIndex,
         offset: Option<f32>,
     ) -> Option<(IslandKey, IslandKey)> {
+        // SoftHidden is allowed to be cut, mainly for the undo action
         match self.edges[usize::from(i_edge)] {
-            EdgeStatus::Joined => {}
+            RealEdgeStatus::Joined => {}
             _ => {
                 return None;
             }
@@ -759,7 +831,7 @@ impl Papercraft {
         //one of the edge faces will be the root of the new island, but we do not know which one, yet
         let i_island = self.island_by_face(i_face_a);
 
-        self.edges[usize::from(i_edge)] = EdgeStatus::Cut(FlapSide::False);
+        self.edges[usize::from(i_edge)] = RealEdgeStatus::Cut(FlapSide::False);
 
         let mut data_found = None;
         let _ = self.traverse_faces(&self.islands[i_island], |i_face, _, fmx| {
@@ -817,7 +889,7 @@ impl Papercraft {
         priority_face: Option<FaceIndex>,
     ) -> Option<JoinResult> {
         match self.edges[usize::from(i_edge)] {
-            EdgeStatus::Cut(_) => {}
+            RealEdgeStatus::Cut(_) => {}
             _ => {
                 return None;
             }
@@ -845,7 +917,7 @@ impl Papercraft {
         if self.compare_islands(&self.islands[i_island_a], &island_b, priority_face) {
             std::mem::swap(&mut self.islands[i_island_a], &mut island_b);
         }
-        self.edges[usize::from(i_edge)] = EdgeStatus::Joined;
+        self.edges[usize::from(i_edge)] = RealEdgeStatus::Joined;
 
         Some(JoinResult {
             i_edge,
@@ -1378,8 +1450,7 @@ impl Papercraft {
             return res;
         };
 
-        // Get all the island edges and sort from best to worst.
-        // And edge is best when it links to a small island, because we don't like small islands.
+        // Get all the island edges that can be joined.
         let mut edges = self
             .island_edges(island)
             .into_iter()
@@ -1388,28 +1459,36 @@ impl Papercraft {
                 let (fa, fb) = edge.faces();
                 // Discard rims
                 let fb = fb?;
-                Some((i_edge, fa, fb))
+                let soft_hidden = Self::should_be_soft_hidden(&self.options, &self.model[i_edge]);
+                Some((i_edge, fa, fb, soft_hidden))
             })
             .collect::<Vec<_>>();
-        edges.sort_by_cached_key(|(_, fa, fb)| {
-            let ia = self.island_by_face(*fa);
-            let ib = self.island_by_face(*fb);
+
+        // Sort from best to worst.
+        // And edge is best when it links to a small island, because we don't like small islands.
+        // Even better if the edge has a small angle.
+        edges.sort_by_cached_key(|&(_, fa, fb, soft_hidden)| {
+            let ia = self.island_by_face(fa);
+            let ib = self.island_by_face(fb);
             let i_other_island = if i_island == ia {
                 ib
             } else if i_island == ib {
                 ia
             } else {
-                return u32::MAX;
+                return (true, u32::MAX);
             };
             let island = self.island_by_key(i_other_island).unwrap();
-            self.island_face_count(island)
+            let face_count = self.island_face_count(island);
+            (!soft_hidden, face_count)
         });
 
         // Islands come and go, use the key to identify
         // We must recompute `i_island`` for every cut/join
         let i_face_root = island.root;
 
-        for (i_edge, fa, fb) in edges {
+        let mut some_soft_hidden_joined = false;
+
+        for (i_edge, fa, fb, soft_hidden) in edges {
             // Check the own side of the edge, to keep the transformation of the island.
             let this_face = if self.island_by_face(fa) == i_island {
                 Some(fa)
@@ -1419,6 +1498,12 @@ impl Papercraft {
                 // Should not happend
                 continue;
             };
+
+            if !soft_hidden && some_soft_hidden_joined {
+                // If any soft-hidden edge has been joined, do not join any non soft-hidden.
+                // The use can click again if they wish.
+                break;
+            }
 
             // Try to join the edge
             let join_res = self.edge_join(i_edge, this_face);
@@ -1439,6 +1524,9 @@ impl Papercraft {
 
             // Success!
             res.push(join_res);
+            if soft_hidden {
+                some_soft_hidden_joined = true;
+            }
         }
 
         res
@@ -1790,8 +1878,8 @@ impl TraverseFacePolicy for NormalTraverseFace<'_> {
 
     fn cross_edge(&self, i_edge: EdgeIndex) -> bool {
         match self.0.edges[usize::from(i_edge)] {
-            EdgeStatus::Cut(_) => false,
-            EdgeStatus::Joined | EdgeStatus::Hidden => true,
+            RealEdgeStatus::Cut(_) => false,
+            RealEdgeStatus::Joined | RealEdgeStatus::Hidden => true,
         }
     }
     fn next_state(
@@ -1807,15 +1895,15 @@ impl TraverseFacePolicy for NormalTraverseFace<'_> {
     }
 }
 
-struct NoMatrixTraverseFace<'a>(&'a [EdgeStatus]);
+struct NoMatrixTraverseFace<'a>(&'a [RealEdgeStatus]);
 
 impl TraverseFacePolicy for NoMatrixTraverseFace<'_> {
     type State = ();
 
     fn cross_edge(&self, i_edge: EdgeIndex) -> bool {
         match self.0[usize::from(i_edge)] {
-            EdgeStatus::Cut(_) => false,
-            EdgeStatus::Joined | EdgeStatus::Hidden => true,
+            RealEdgeStatus::Cut(_) => false,
+            RealEdgeStatus::Joined | RealEdgeStatus::Hidden => true,
         }
     }
 }
@@ -1828,7 +1916,7 @@ impl TraverseFacePolicy for FlatTraverseFace<'_> {
     fn cross_edge(&self, i_edge: EdgeIndex) -> bool {
         match self.0.edge_status(i_edge) {
             EdgeStatus::Joined | EdgeStatus::Cut(_) => false,
-            EdgeStatus::Hidden => true,
+            EdgeStatus::Hidden | EdgeStatus::SoftHidden => true,
         }
     }
 }
@@ -1841,7 +1929,7 @@ impl TraverseFacePolicy for FlatTraverseFaceWithMatrix<'_> {
     fn cross_edge(&self, i_edge: EdgeIndex) -> bool {
         match self.0.edge_status(i_edge) {
             EdgeStatus::Joined | EdgeStatus::Cut(_) => false,
-            EdgeStatus::Hidden => true,
+            EdgeStatus::Hidden | EdgeStatus::SoftHidden => true,
         }
     }
 
@@ -1963,12 +2051,12 @@ macro_rules! ser_de_for_enum_as_i32 {
 }
 
 ser_de_for_enum_as_i32! {
-    EdgeStatus "invalid edge status" {
-        EdgeStatus::Hidden => 0,
-        EdgeStatus::Joined => 1,
-        EdgeStatus::Cut(FlapSide::False) => 2,
-        EdgeStatus::Cut(FlapSide::True) => 3,
-        EdgeStatus::Cut(FlapSide::Hidden) => 4,
+    RealEdgeStatus "invalid edge status" {
+        RealEdgeStatus::Hidden => 0,
+        RealEdgeStatus::Joined => 1,
+        RealEdgeStatus::Cut(FlapSide::False) => 2,
+        RealEdgeStatus::Cut(FlapSide::True) => 3,
+        RealEdgeStatus::Cut(FlapSide::Hidden) => 4,
     }
 }
 

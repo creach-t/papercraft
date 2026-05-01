@@ -31,8 +31,8 @@ use crate::{
 use crate::{
     paper::{
         EdgeId, EdgeIdPosition, EdgeIndex, EdgeStatus, EdgeToggleFlapAction, Face, FaceIndex,
-        FlapGeom, FlapSide, FlapStyle, FoldStyle, IslandKey, JoinResult, MaterialIndex, Model,
-        PaperOptions, Papercraft,
+        FlapGeom, FlapSide, FlapStyle, FoldStyle, IslandKey, JoinResult, LabelKey,
+        MaterialIndex, Model, PaperOptions, Papercraft,
     },
     printable_island_name,
 };
@@ -65,6 +65,13 @@ pub struct GLObjects {
     pub paper_vertices_edge_sel: glr::DynamicVertexArray<MVertex2DLine>,
     pub paper_vertices_shadow_flap: glr::DynamicVertexArray<MVertex2DColor>,
     pub paper_text: Vec<(TextureUniqueId, glr::DynamicVertexArray<MVertexText>)>,
+
+    // Labels
+    pub paper_vertices_label: glr::DynamicVertexArray<MVertex2DColor>,
+    pub paper_vertices_label_border: glr::DynamicVertexArray<MVertex2DLine>,
+    pub paper_vertices_label_thumb: glr::DynamicVertexArray<MVertexText>,
+    pub paper_label_text: Vec<(TextureUniqueId, glr::DynamicVertexArray<MVertexText>)>,
+    pub label_thumbnail_tex: Option<glr::Texture>,
 
     // 2D background
     pub paper_vertices_page: glr::DynamicVertexArray<MVertex2DColor>,
@@ -168,6 +175,11 @@ pub struct PapercraftContext {
     pre_selection: Option<(Vector2, Vector2, Vec<IslandFaceKey>, bool)>,
     // The island that has just been selected
     just_selected: Option<IslandFaceKey>,
+
+    // Label interaction
+    pub selected_label: Option<LabelKey>,
+    // (key, paper-space cursor offset from label.pos at grab time)
+    grabbed_label: Option<(LabelKey, Vector2)>,
 
     pub ui: UiSettings,
 }
@@ -565,12 +577,24 @@ impl Rectangle {
     }
 }
 
+enum EdgeAction {
+    Normal,
+    JoinStrip,
+    Reverse,
+}
+
 impl PapercraftContext {
     pub fn papercraft(&self) -> &Papercraft {
         &self.papercraft
     }
+    pub fn papercraft_mut(&mut self) -> &mut Papercraft {
+        &mut self.papercraft
+    }
     pub fn gl_objs(&self) -> &GLObjects {
         &self.gl_objs
+    }
+    pub fn set_label_thumbnail(&mut self, tex: glr::Texture) {
+        self.gl_objs.label_thumbnail_tex = Some(tex);
     }
     pub fn set_papercraft_options(&mut self, options: PaperOptions, push_undo_action: bool) {
         let island_pos = push_undo_action.then(|| {
@@ -631,6 +655,8 @@ impl PapercraftContext {
             rotation_center: None,
             pre_selection: None,
             just_selected: None,
+            selected_label: None,
+            grabbed_label: None,
             ui: UiSettings {
                 mode: MouseMode::Face,
                 trans_scene,
@@ -722,7 +748,7 @@ impl PapercraftContext {
                 }
             }
             let draw_flap = match edge_status {
-                EdgeStatus::Hidden => {
+                EdgeStatus::Hidden | EdgeStatus::SoftHidden => {
                     // hidden edges are never drawn
                     continue;
                 }
@@ -772,11 +798,6 @@ impl PapercraftContext {
             //cut with a flap
             let crease_kind = if edge_status == EdgeStatus::Joined || draw_flap.is_visible() {
                 let angle_3d = edge.angle();
-                if edge_status == EdgeStatus::Joined
-                    && Rad(angle_3d.0.abs()) < Rad::from(Deg(options.hidden_line_angle))
-                {
-                    continue;
-                }
                 let kind = if angle_3d.0.is_sign_negative() {
                     EdgeDrawKind::Valley
                 } else {
@@ -1240,6 +1261,116 @@ impl PapercraftContext {
             }
         }
 
+        // Labels: background, border, title text, thumbnail quad
+        {
+            let mat = MaterialIndex::from(0);
+            let uv0 = Vector2::zero();
+            let label_bg_color = Rgba::new(1.0, 1.0, 1.0, 1.0);
+            let label_border_color = Rgba::new(0.1, 0.1, 0.1, 1.0);
+            const BORDER_W: f32 = 0.5;
+
+            let mut vertices_label: Vec<MVertex2DColor> = Vec::new();
+            let mut lines_label: Vec<Line2D> = Vec::new();
+            let mut vertices_label_thumb: Vec<MVertexText> = Vec::new();
+            // Title text goes in its own buffer so it renders regardless of show_texts
+            let mut vertices_label_text: Vec<(TextureUniqueId, Vec<MVertexText>)> = Vec::new();
+
+            let has_thumb = self.gl_objs.label_thumbnail_tex.is_some();
+
+            for (_key, label) in self.papercraft.labels() {
+                let p0 = label.pos;
+                let p1 = label.pos + label.size;
+
+                // White background
+                let mk = |pos_2d: Vector2| MVertex2DColor {
+                    pos_2d,
+                    uv: uv0,
+                    mat,
+                    color: label_bg_color,
+                };
+                let tl = mk(p0);
+                let tr_ = mk(Vector2::new(p1.x, p0.y));
+                let br = mk(p1);
+                let bl = mk(Vector2::new(p0.x, p1.y));
+                vertices_label.extend_from_slice(&[tl, tr_, br, tl, br, bl]);
+
+                // Border + vertical separator between thumb and title
+                let mkl = |a: Vector2, b: Vector2| Line2D {
+                    p0: a,
+                    p1: b,
+                    dash0: 0.0,
+                    dash1: 0.0,
+                    width_left: BORDER_W,
+                    width_right: 0.0,
+                };
+                lines_label.push(mkl(p0, Vector2::new(p1.x, p0.y)));
+                lines_label.push(mkl(Vector2::new(p1.x, p0.y), p1));
+                lines_label.push(mkl(p1, Vector2::new(p0.x, p1.y)));
+                lines_label.push(mkl(Vector2::new(p0.x, p1.y), p0));
+
+                // Layout: square thumb on left, title fills the right
+                let thumb_size = label.size.y; // square side = full label height
+                let sep_x = p0.x + thumb_size;
+                lines_label.push(mkl(
+                    Vector2::new(sep_x, p0.y),
+                    Vector2::new(sep_x, p1.y),
+                ));
+
+                // Title: large, centered vertically in the right zone
+                let title_font_size = label.size.y * 0.35;
+                let title_text = PrintableText {
+                    size: title_font_size,
+                    pos: Vector2::new(
+                        (sep_x + p1.x) / 2.0,
+                        (p0.y + p1.y) / 2.0,
+                    ),
+                    angle: Rad(0.0),
+                    align: TextAlign::Center,
+                    text: label.title.clone(),
+                };
+                text_builder.make_text(&title_text, &mut vertices_label_text);
+
+                // Thumbnail: square on the left side
+                if has_thumb {
+                    let tl = MVertexText {
+                        pos: p0,
+                        uv: Vector2::new(0.0, 0.0),
+                    };
+                    let tr_ = MVertexText {
+                        pos: Vector2::new(sep_x, p0.y),
+                        uv: Vector2::new(1.0, 0.0),
+                    };
+                    let br = MVertexText {
+                        pos: Vector2::new(sep_x, p1.y),
+                        uv: Vector2::new(1.0, 1.0),
+                    };
+                    let bl = MVertexText {
+                        pos: Vector2::new(p0.x, p1.y),
+                        uv: Vector2::new(0.0, 1.0),
+                    };
+                    vertices_label_thumb.extend_from_slice(&[tl, tr_, br, tl, br, bl]);
+                }
+            }
+
+            self.gl_objs.paper_vertices_label.set(vertices_label);
+            build_vertices_for_lines_2d(
+                self.gl_objs.paper_vertices_label_border.data_mut(),
+                &lines_label,
+                label_border_color,
+            );
+            self.gl_objs
+                .paper_vertices_label_thumb
+                .set(vertices_label_thumb);
+
+            self.gl_objs.paper_label_text.clear();
+            for vt in vertices_label_text {
+                let mut a =
+                    glr::DynamicVertexArray::new(self.gl_objs.paper_vertices.gl()).unwrap();
+                a.set(vt.1);
+                self.gl_objs.paper_label_text.push((vt.0, a));
+            }
+        }
+
         self.gl_objs.paper_vertices.set(args.vertices);
         build_vertices_for_lines_2d(
             self.gl_objs.paper_vertices_edge_cut.data_mut(),
@@ -1391,20 +1522,12 @@ impl PapercraftContext {
                 }
             } else {
                 match status {
-                    EdgeStatus::Hidden => MLINE3D_HIDDEN,
-                    EdgeStatus::Joined => {
-                        let angle_3d = edge.angle();
-                        if Rad(angle_3d.0.abs())
-                            < Rad::from(Deg(self.papercraft.options().hidden_line_angle))
-                        {
-                            MLINE3D_HIDDEN
-                        } else {
-                            self.papercraft
-                                .options()
-                                .line3d_normal
-                                .to_3dstatus(&MLINE3D_NORMAL)
-                        }
-                    }
+                    EdgeStatus::Hidden | EdgeStatus::SoftHidden => MLINE3D_HIDDEN,
+                    EdgeStatus::Joined => self
+                        .papercraft
+                        .options()
+                        .line3d_normal
+                        .to_3dstatus(&MLINE3D_NORMAL),
                     EdgeStatus::Cut(_) => self
                         .papercraft
                         .options()
@@ -1442,7 +1565,7 @@ impl PapercraftContext {
             .chain(pre_add)
             .filter(|s| {
                 let i = self.papercraft.island_key_by_face_key(**s);
-                self.island_slice_position(&pre_remove, i).is_none()
+                self.island_slice_position(pre_remove, i).is_none()
             })
             .copied()
             .collect();
@@ -1731,7 +1854,7 @@ impl PapercraftContext {
     ) -> Option<Vec<UndoAction>> {
         match self.papercraft.edge_status(i_edge) {
             EdgeStatus::Hidden => None,
-            EdgeStatus::Joined => {
+            EdgeStatus::Joined | EdgeStatus::SoftHidden => {
                 // Compute the island of this edge, to check if it is selected and select the new pieces
                 let i_face = self.papercraft.model()[i_edge].faces().0;
                 let i_island = self.papercraft.island_by_face(i_face);
@@ -1768,7 +1891,13 @@ impl PapercraftContext {
         Some(undo_actions)
     }
 
-    pub fn scene_analyze_click(&self, mode: MouseMode, size: Vector2, pos: Vector2) -> ClickResult {
+    pub fn scene_analyze_click(
+        &self,
+        mode: MouseMode,
+        size: Vector2,
+        pos: Vector2,
+        allow_soft_hidden: bool,
+    ) -> ClickResult {
         let x = (pos.x / size.x) * 2.0 - 1.0;
         let y = -((pos.y / size.y) * 2.0 - 1.0);
         let click = Point3::new(x, y, 1.0);
@@ -1810,7 +1939,8 @@ impl PapercraftContext {
         let mut hit_edge = None;
         for (i_edge, edge) in self.papercraft.model().edges() {
             match (self.papercraft.edge_status(i_edge), mode) {
-                (EdgeStatus::Hidden, _) => continue,
+                (EdgeStatus::SoftHidden, MouseMode::Edge) if allow_soft_hidden => (),
+                (EdgeStatus::Hidden | EdgeStatus::SoftHidden, _) => continue,
                 (EdgeStatus::Joined, MouseMode::Flap) => continue,
                 _ => (),
             }
@@ -1858,7 +1988,13 @@ impl PapercraftContext {
         }
     }
 
-    pub fn paper_analyze_click(&self, mode: MouseMode, size: Vector2, pos: Vector2) -> ClickResult {
+    pub fn paper_analyze_click(
+        &self,
+        mode: MouseMode,
+        size: Vector2,
+        pos: Vector2,
+        allow_soft_hidden: bool,
+    ) -> ClickResult {
         let click = self.ui.trans_paper.paper_click(size, pos);
         let mx = self.ui.trans_paper.ortho * self.ui.trans_paper.mx;
         let scale = self.papercraft.options().scale;
@@ -1890,7 +2026,10 @@ impl PapercraftContext {
                     MouseMode::Edge | MouseMode::Flap | MouseMode::ReadOnly => {
                         for i_edge in face.index_edges() {
                             match (self.papercraft.edge_status(i_edge), mode) {
-                                (EdgeStatus::Hidden, _) => continue,
+                                (EdgeStatus::SoftHidden, MouseMode::Edge) if allow_soft_hidden => {
+                                    ()
+                                }
+                                (EdgeStatus::Hidden | EdgeStatus::SoftHidden, _) => continue,
                                 (EdgeStatus::Joined, MouseMode::Flap) => continue,
                                 _ => (),
                             }
@@ -1947,7 +2086,12 @@ impl PapercraftContext {
         if mods.contains(KeyMod::Super) {
             return RebuildFlags::empty();
         }
-        let selection = self.scene_analyze_click(self.ui.mode, size, pos);
+        let selection = self.scene_analyze_click(
+            self.ui.mode,
+            size,
+            pos,
+            /* allow_soft_hidden */ mods.contains(KeyMod::Ctrl),
+        );
         let flags = if mods.contains(KeyMod::Alt) {
             SetSelectionFlags::ALT_PRESSED
         } else {
@@ -1983,8 +2127,18 @@ impl PapercraftContext {
         RebuildFlags::SCENE_REDRAW
     }
     #[must_use]
-    pub fn scene_button1_dblclick_event(&mut self, size: Vector2, pos: Vector2) -> RebuildFlags {
-        let selection = self.scene_analyze_click(MouseMode::Face, size, pos);
+    pub fn scene_button1_dblclick_event(
+        &mut self,
+        size: Vector2,
+        pos: Vector2,
+        mods: KeyMod,
+    ) -> RebuildFlags {
+        let selection = self.scene_analyze_click(
+            MouseMode::Face,
+            size,
+            pos,
+            /* allow_soft_hidden */ mods.contains(KeyMod::Ctrl),
+        );
         let ClickResult::Face(i_face) = selection else {
             return RebuildFlags::empty();
         };
@@ -2011,12 +2165,20 @@ impl PapercraftContext {
         &mut self,
         i_edge: EdgeIndex,
         i_face: Option<FaceIndex>,
-        shift_action: bool,
+        edge_action: EdgeAction,
     ) -> RebuildFlags {
-        let undo = if shift_action {
-            self.try_join_strip(i_edge)
-        } else {
-            self.edge_toggle_cut(i_edge, i_face)
+        let undo = match edge_action {
+            EdgeAction::Normal => self.edge_toggle_cut(i_edge, i_face),
+            EdgeAction::JoinStrip => self.try_join_strip(i_edge),
+            EdgeAction::Reverse => {
+                let edge = &self.papercraft.model()[i_edge];
+                let i_face = match (i_face, edge.faces()) {
+                    (Some(f), (fa, Some(fb))) if f == fa => Some(fb),
+                    (Some(f), (fa, Some(fb))) if f == fb => Some(fa),
+                    _ => i_face,
+                };
+                self.edge_toggle_cut(i_edge, i_face)
+            }
         };
         if let Some(undo) = undo {
             self.push_undo_action(undo);
@@ -2026,6 +2188,7 @@ impl PapercraftContext {
             | RebuildFlags::SELECTION
             | RebuildFlags::ISLANDS
     }
+
     #[must_use]
     fn do_flap_action(&mut self, i_edge: EdgeIndex, shift_action: bool) -> RebuildFlags {
         let action = if shift_action {
@@ -2051,7 +2214,12 @@ impl PapercraftContext {
         if mods.contains(KeyMod::Super) {
             return RebuildFlags::empty();
         }
-        let selection = self.scene_analyze_click(self.ui.mode, size, pos);
+        let selection = self.scene_analyze_click(
+            self.ui.mode,
+            size,
+            pos,
+            /* allow_soft_hidden */ mods.contains(KeyMod::Ctrl),
+        );
         let flags = if mods.contains(KeyMod::Ctrl) {
             SetSelectionFlags::ADD_TO_SEL
         } else {
@@ -2060,7 +2228,14 @@ impl PapercraftContext {
         let flags = flags | SetSelectionFlags::CLICKED | SetSelectionFlags::RELEASED;
         match (self.ui.mode, selection) {
             (MouseMode::Edge, ClickResult::Edge(i_edge, i_face)) => {
-                self.do_edge_action(i_edge, i_face, mods.contains(KeyMod::Shift))
+                let edge_action = if mods.contains(KeyMod::Shift) {
+                    EdgeAction::JoinStrip
+                } else if mods.contains(KeyMod::Ctrl) {
+                    EdgeAction::Reverse
+                } else {
+                    EdgeAction::Normal
+                };
+                self.do_edge_action(i_edge, i_face, edge_action)
             }
             (MouseMode::Flap, ClickResult::Edge(i_edge, _)) => {
                 self.do_flap_action(i_edge, mods.contains(KeyMod::Shift))
@@ -2094,6 +2269,19 @@ impl PapercraftContext {
     ) -> RebuildFlags {
         let delta = pos - self.last_cursor_pos;
         self.last_cursor_pos = pos;
+
+        // Label drag: move the grabbed label
+        if let Some((key, offset)) = self.grabbed_label {
+            if !dragging {
+                return RebuildFlags::empty();
+            }
+            let click = self.ui.trans_paper.paper_click(size, pos);
+            let new_pos = click - offset;
+            if let Some(label) = self.papercraft.label_by_key_mut(key) {
+                label.pos = new_pos;
+            }
+            return RebuildFlags::PAPER;
+        }
 
         // Check if any island is to be moved
         match (
@@ -2241,7 +2429,36 @@ impl PapercraftContext {
         mods: KeyMod,
         modifiable: bool,
     ) -> RebuildFlags {
-        let selection = self.paper_analyze_click(self.ui.mode, size, pos);
+        // Label hit-test takes priority
+        let click = self.ui.trans_paper.paper_click(size, pos);
+        if let Some(key) = self.papercraft.label_at(click) {
+            let was_selected = self.selected_label == Some(key);
+            self.selected_label = Some(key);
+            // Set up grab offset (pos relative to label.pos at click time)
+            if modifiable {
+                let label_pos = self.papercraft.label_by_key(key).map(|l| l.pos).unwrap_or(click);
+                self.grabbed_label = Some((key, click - label_pos));
+            }
+            // Deselect islands
+            if !was_selected {
+                self.selected_islands.clear();
+                self.selected_face = None;
+                self.selected_edges = None;
+            }
+            return RebuildFlags::SELECTION;
+        }
+        // Clicked outside any label → deselect label
+        if self.selected_label.is_some() {
+            self.selected_label = None;
+            self.grabbed_label = None;
+        }
+
+        let selection = self.paper_analyze_click(
+            self.ui.mode,
+            size,
+            pos,
+            /* allow_soft_hidden */ mods.contains(KeyMod::Ctrl),
+        );
         let flags = if mods.contains(KeyMod::Ctrl) {
             SetSelectionFlags::ADD_TO_SEL
         } else {
@@ -2252,7 +2469,14 @@ impl PapercraftContext {
         match (self.ui.mode, selection) {
             (MouseMode::Edge, ClickResult::Edge(i_edge, i_face)) => {
                 self.grabbed_island = None;
-                self.do_edge_action(i_edge, i_face, mods.contains(KeyMod::Shift))
+                let edge_action = if mods.contains(KeyMod::Shift) {
+                    EdgeAction::JoinStrip
+                } else if mods.contains(KeyMod::Ctrl) {
+                    EdgeAction::Reverse
+                } else {
+                    EdgeAction::Normal
+                };
+                self.do_edge_action(i_edge, i_face, edge_action)
             }
             (MouseMode::Flap, ClickResult::Edge(i_edge, _)) => {
                 self.do_flap_action(i_edge, mods.contains(KeyMod::Shift))
@@ -2294,7 +2518,12 @@ impl PapercraftContext {
         mods: KeyMod,
     ) -> RebuildFlags {
         self.pre_selection = None;
-        let selection = self.paper_analyze_click(self.ui.mode, size, pos);
+        let selection = self.paper_analyze_click(
+            self.ui.mode,
+            size,
+            pos,
+            /* allow_soft_hidden */ mods.contains(KeyMod::Ctrl),
+        );
         let flags = if mods.contains(KeyMod::Ctrl) {
             SetSelectionFlags::ADD_TO_SEL
         } else {
@@ -2327,12 +2556,18 @@ impl PapercraftContext {
         self.last_cursor_pos = pos;
         self.rotation_center = None;
         self.grabbed_island = None;
+        self.grabbed_label = None;
         // Super is usually only handled in the 3d scene, however when doing bit rotations the mouse will hover
         // the paper, and it is convenient to check it here too, at least when hovering.
         if mods.contains(KeyMod::Super) {
             return RebuildFlags::empty();
         }
-        let selection = self.paper_analyze_click(self.ui.mode, size, pos);
+        let selection = self.paper_analyze_click(
+            self.ui.mode,
+            size,
+            pos,
+            /* allow_soft_hidden */ mods.contains(KeyMod::Ctrl),
+        );
         let flags = if mods.contains(KeyMod::Alt) {
             SetSelectionFlags::ALT_PRESSED
         } else {
@@ -2701,6 +2936,11 @@ impl GLObjects {
         let paper_vertices_edge_sel = glr::DynamicVertexArray::new(gl)?;
         let paper_vertices_shadow_flap = glr::DynamicVertexArray::new(gl)?;
 
+        let paper_vertices_label = glr::DynamicVertexArray::new(gl)?;
+        let paper_vertices_label_border = glr::DynamicVertexArray::new(gl)?;
+        let paper_vertices_label_thumb = glr::DynamicVertexArray::new(gl)?;
+        let paper_label_text = Vec::new();
+
         let paper_vertices_page = glr::DynamicVertexArray::new(gl)?;
         let paper_vertices_margin = glr::DynamicVertexArray::new(gl)?;
 
@@ -2723,6 +2963,12 @@ impl GLObjects {
             paper_vertices_flap_edge,
             paper_vertices_edge_sel,
             paper_vertices_shadow_flap,
+
+            paper_vertices_label,
+            paper_vertices_label_border,
+            paper_vertices_label_thumb,
+            paper_label_text,
+            label_thumbnail_tex: None,
 
             paper_vertices_page,
             paper_vertices_margin,
