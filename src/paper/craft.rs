@@ -125,16 +125,6 @@ pub struct Label {
 }
 
 impl Label {
-    pub fn new(pos: Vector2, title: String) -> Label {
-        Label {
-            pos,
-            size: Vector2::new(60.0, 50.0),
-            title,
-        }
-    }
-    pub fn title_height() -> f32 {
-        10.0
-    }
     pub fn contains(&self, p: Vector2) -> bool {
         p.x >= self.pos.x
             && p.x <= self.pos.x + self.size.x

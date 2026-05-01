@@ -31,7 +31,7 @@ use crate::{
 use crate::{
     paper::{
         EdgeId, EdgeIdPosition, EdgeIndex, EdgeStatus, EdgeToggleFlapAction, Face, FaceIndex,
-        FlapGeom, FlapSide, FlapStyle, FoldStyle, IslandKey, JoinResult, Label, LabelKey,
+        FlapGeom, FlapSide, FlapStyle, FoldStyle, IslandKey, JoinResult, LabelKey,
         MaterialIndex, Model, PaperOptions, Papercraft,
     },
     printable_island_name,
@@ -70,6 +70,7 @@ pub struct GLObjects {
     pub paper_vertices_label: glr::DynamicVertexArray<MVertex2DColor>,
     pub paper_vertices_label_border: glr::DynamicVertexArray<MVertex2DLine>,
     pub paper_vertices_label_thumb: glr::DynamicVertexArray<MVertexText>,
+    pub paper_label_text: Vec<(TextureUniqueId, glr::DynamicVertexArray<MVertexText>)>,
     pub label_thumbnail_tex: Option<glr::Texture>,
 
     // 2D background
@@ -1267,11 +1268,12 @@ impl PapercraftContext {
             let label_bg_color = Rgba::new(1.0, 1.0, 1.0, 1.0);
             let label_border_color = Rgba::new(0.1, 0.1, 0.1, 1.0);
             const BORDER_W: f32 = 0.5;
-            let title_h = Label::title_height();
 
             let mut vertices_label: Vec<MVertex2DColor> = Vec::new();
             let mut lines_label: Vec<Line2D> = Vec::new();
             let mut vertices_label_thumb: Vec<MVertexText> = Vec::new();
+            // Title text goes in its own buffer so it renders regardless of show_texts
+            let mut vertices_label_text: Vec<(TextureUniqueId, Vec<MVertexText>)> = Vec::new();
 
             let has_thumb = self.gl_objs.label_thumbnail_tex.is_some();
 
@@ -1279,7 +1281,7 @@ impl PapercraftContext {
                 let p0 = label.pos;
                 let p1 = label.pos + label.size;
 
-                // Filled white background
+                // White background
                 let mk = |pos_2d: Vector2| MVertex2DColor {
                     pos_2d,
                     uv: uv0,
@@ -1292,7 +1294,7 @@ impl PapercraftContext {
                 let bl = mk(Vector2::new(p0.x, p1.y));
                 vertices_label.extend_from_slice(&[tl, tr_, br, tl, br, bl]);
 
-                // Border: 4 edges + separator line below title
+                // Border + vertical separator between thumb and title
                 let mkl = |a: Vector2, b: Vector2| Line2D {
                     p0: a,
                     p1: b,
@@ -1305,39 +1307,41 @@ impl PapercraftContext {
                 lines_label.push(mkl(Vector2::new(p1.x, p0.y), p1));
                 lines_label.push(mkl(p1, Vector2::new(p0.x, p1.y)));
                 lines_label.push(mkl(Vector2::new(p0.x, p1.y), p0));
-                // separator below title
-                let sep_y = p0.y + title_h;
+
+                // Layout: square thumb on left, title fills the right
+                let thumb_size = label.size.y; // square side = full label height
+                let sep_x = p0.x + thumb_size;
                 lines_label.push(mkl(
-                    Vector2::new(p0.x, sep_y),
-                    Vector2::new(p1.x, sep_y),
+                    Vector2::new(sep_x, p0.y),
+                    Vector2::new(sep_x, p1.y),
                 ));
 
-                // Title text (centered in the title strip)
+                // Title: large, centered vertically in the right zone
+                let title_font_size = label.size.y * 0.35;
                 let title_text = PrintableText {
-                    size: FONT_SIZE * 1.2,
+                    size: title_font_size,
                     pos: Vector2::new(
-                        p0.x + label.size.x / 2.0,
-                        p0.y + title_h / 2.0 + FONT_SIZE * 0.6,
+                        (sep_x + p1.x) / 2.0,
+                        (p0.y + p1.y) / 2.0,
                     ),
                     angle: Rad(0.0),
                     align: TextAlign::Center,
                     text: label.title.clone(),
                 };
-                text_builder.make_text(&title_text, &mut args.vertices_text);
+                text_builder.make_text(&title_text, &mut vertices_label_text);
 
-                // Thumbnail quad (UV 0..1 maps to the rendered 3D texture)
+                // Thumbnail: square on the left side
                 if has_thumb {
-                    let ty0 = sep_y;
                     let tl = MVertexText {
-                        pos: Vector2::new(p0.x, ty0),
+                        pos: p0,
                         uv: Vector2::new(0.0, 0.0),
                     };
                     let tr_ = MVertexText {
-                        pos: Vector2::new(p1.x, ty0),
+                        pos: Vector2::new(sep_x, p0.y),
                         uv: Vector2::new(1.0, 0.0),
                     };
                     let br = MVertexText {
-                        pos: p1,
+                        pos: Vector2::new(sep_x, p1.y),
                         uv: Vector2::new(1.0, 1.0),
                     };
                     let bl = MVertexText {
@@ -1357,6 +1361,14 @@ impl PapercraftContext {
             self.gl_objs
                 .paper_vertices_label_thumb
                 .set(vertices_label_thumb);
+
+            self.gl_objs.paper_label_text.clear();
+            for vt in vertices_label_text {
+                let mut a =
+                    glr::DynamicVertexArray::new(self.gl_objs.paper_vertices.gl()).unwrap();
+                a.set(vt.1);
+                self.gl_objs.paper_label_text.push((vt.0, a));
+            }
         }
 
         self.gl_objs.paper_vertices.set(args.vertices);
@@ -2927,6 +2939,7 @@ impl GLObjects {
         let paper_vertices_label = glr::DynamicVertexArray::new(gl)?;
         let paper_vertices_label_border = glr::DynamicVertexArray::new(gl)?;
         let paper_vertices_label_thumb = glr::DynamicVertexArray::new(gl)?;
+        let paper_label_text = Vec::new();
 
         let paper_vertices_page = glr::DynamicVertexArray::new(gl)?;
         let paper_vertices_margin = glr::DynamicVertexArray::new(gl)?;
@@ -2954,6 +2967,7 @@ impl GLObjects {
             paper_vertices_label,
             paper_vertices_label_border,
             paper_vertices_label_thumb,
+            paper_label_text,
             label_thumbnail_tex: None,
 
             paper_vertices_page,

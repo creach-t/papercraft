@@ -2374,23 +2374,25 @@ impl GlobalContext {
             self.data.reset_views(self.sz_scene, self.sz_paper);
         }
         if menu_actions.add_label {
-            // Place the new label at the center of the first page
+            // Place the label at the top of page 1, spanning the usable width
             let options = self.data.papercraft().options();
             let page_pos = options.page_position(0);
             let page_size = Vector2::from(options.page_size);
-            let center = page_pos + page_size / 2.0;
-            let label_size = Vector2::new(60.0, 50.0);
-            let pos = center - label_size / 2.0;
+            let (margin_top, margin_left, margin_right, _) = options.margin;
+            let usable_w = page_size.x - margin_left - margin_right;
+            let label_size = Vector2::new(usable_w, 70.0);
+            let pos = Vector2::new(page_pos.x + margin_left, page_pos.y + margin_top);
             let model_name = self
                 .file_name
                 .as_deref()
                 .and_then(|p| p.file_stem())
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| tr!("Label"));
-            let key = self
-                .data
-                .papercraft_mut()
-                .add_label(Label::new(pos, model_name.clone()));
+            let key = self.data.papercraft_mut().add_label(Label {
+                pos,
+                size: label_size,
+                title: model_name.clone(),
+            });
             self.data.selected_label = Some(key);
             self.label_title_buf = model_name;
             // Ensure the thumbnail texture exists; create it now if not
@@ -3090,7 +3092,23 @@ impl GlobalContext {
                 self.gl.bind_texture(glow::TEXTURE_2D, None);
             }
 
-            // Draw the texts (island names, edge ids, label titles)
+            // Label titles always visible (not gated by show_texts)
+            self.gl.active_texture(glow::TEXTURE0);
+            for (ut, pt) in &self.data.gl_objs().paper_label_text {
+                self.gl.bind_texture(
+                    glow::TEXTURE_2D,
+                    Renderer::unmap_tex(
+                        imgui
+                            .io()
+                            .font_atlas()
+                            .get_texture_by_unique_id(*ut)
+                            .unwrap(),
+                    ),
+                );
+                gl_fixs.prg_text.draw(&u, pt, glow::TRIANGLES);
+            }
+
+            // Draw the texts (island names, edge ids)
             if self.data.ui.show_texts {
                 self.gl.active_texture(glow::TEXTURE0);
                 for (ut, pt) in &self.data.gl_objs().paper_text {
@@ -3209,6 +3227,10 @@ impl GlobalContext {
             *o = self.data.papercraft().options().clone();
         }
         self.rebuild = RebuildFlags::all();
+        // Regenerate label thumbnail for any labels that were loaded
+        if self.data.papercraft().labels().next().is_some() {
+            self.create_label_thumbnail();
+        }
         Ok(())
     }
     fn create_thumbnail(&mut self) -> image::RgbaImage {
@@ -3393,6 +3415,38 @@ impl GlobalContext {
             let rot_y = Quaternion::from_axis_angle(V3::new(0.0, 1.0, 0.0), cgmath::Deg(-30.0_f32));
             let rot_x = Quaternion::from_axis_angle(V3::new(1.0, 0.0, 0.0), cgmath::Deg(20.0_f32));
             self.data.ui.trans_scene.rotation = (rot_y * rot_x).normalize();
+
+            // Perspective-correct tight-fit: scale so the model fills ~90% of the thumbnail.
+            // Same formula as generate_3d_pdf_views: S = fill*dist / (|rv.proj|*focal + fill*rv.z)
+            {
+                use cgmath::Matrix3;
+                const FILL: f32 = 0.90;
+                let obj_mat = self.data.ui.trans_scene.obj;
+                let rot_mat = Matrix3::from(self.data.ui.trans_scene.rotation);
+                let focal = self.data.ui.trans_scene.persp[1][1];
+                let camera_dist = -self.data.ui.trans_scene.location.z;
+                let tight_scale = self
+                    .data
+                    .papercraft()
+                    .model()
+                    .vertices()
+                    .fold(f32::INFINITY, |min_s, (_, v)| {
+                        use cgmath::Transform;
+                        let p = v.pos();
+                        let nv = obj_mat
+                            .transform_point(cgmath::Point3::new(p.x, p.y, p.z))
+                            .to_vec();
+                        let rv = rot_mat * nv;
+                        let lim = |proj: f32| {
+                            let d = proj.abs() * focal + FILL * rv.z;
+                            if d > 0.0 { FILL * camera_dist / d } else { f32::INFINITY }
+                        };
+                        min_s.min(lim(rv.x)).min(lim(rv.y))
+                    });
+                if tight_scale.is_finite() && tight_scale > 0.0 {
+                    self.data.ui.trans_scene.scale = tight_scale;
+                }
+            }
             self.data.ui.trans_scene.recompute_obj();
 
             // Flip Y so the image is upright when used as a texture
@@ -3401,7 +3455,8 @@ impl GlobalContext {
 
             self.data.pre_render(RebuildFlags::all(), &TextBuilderDummy);
             self.gl.viewport(0, 0, W, H);
-            self.gl.clear_color(0.95, 0.95, 0.95, 1.0);
+            // Transparent background — the model composites over the white page behind it
+            self.gl.clear_color(0.0, 0.0, 0.0, 0.0);
             self.gl.clear_depth_f32(1.0);
             self.gl
                 .clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);

@@ -934,6 +934,43 @@ impl GlobalContext {
                     glow::TRIANGLES,
                 );
 
+                // Labels: background, border, thumbnail
+                u.texturize = 0;
+                gl_fixs.prg_paper_solid.draw(
+                    &u,
+                    &self.data.gl_objs().paper_vertices_label,
+                    glow::TRIANGLES,
+                );
+                gl_fixs.prg_paper_line.draw(
+                    &u,
+                    &self.data.gl_objs().paper_vertices_label_border,
+                    glow::TRIANGLES,
+                );
+                if let Some(tex) = &self.data.gl_objs().label_thumbnail_tex {
+                    self.gl.active_texture(glow::TEXTURE0);
+                    self.gl.bind_texture(glow::TEXTURE_2D, Some(tex.id()));
+                    gl_fixs.prg_label_color.draw(
+                        &u,
+                        &self.data.gl_objs().paper_vertices_label_thumb,
+                        glow::TRIANGLES,
+                    );
+                    self.gl.bind_texture(glow::TEXTURE_2D, None);
+                }
+
+                // Label titles (rendered via font atlas like other texts)
+                if let Some(font_atlas) = font_atlas.as_ref() {
+                    self.gl.active_texture(glow::TEXTURE0);
+                    for (ut, pt) in &self.data.gl_objs().paper_label_text {
+                        self.gl.bind_texture(
+                            glow::TEXTURE_2D,
+                            Renderer::unmap_tex(
+                                font_atlas.get_texture_by_unique_id(*ut).unwrap(),
+                            ),
+                        );
+                        gl_fixs.prg_text.draw(&u, pt, glow::TRIANGLES);
+                    }
+                }
+
                 // Draw the texts
                 if let Some(font_atlas) = font_atlas.as_ref()
                     && options.edge_id_position == EdgeIdPosition::Inside
@@ -1014,6 +1051,34 @@ impl GlobalContext {
                         text,
                     });
                 }
+                // Label titles as vector text (for PDF/SVG)
+                for (_key, label) in self.data.papercraft().labels() {
+                    let p0 = label.pos;
+                    let p1 = label.pos + label.size;
+                    let thumb_size = label.size.y;
+                    let sep_x = p0.x + thumb_size;
+                    let page_end = page_pos + page_size_mm;
+                    // skip if label doesn't overlap this page
+                    if p1.x < page_pos.x
+                        || p0.x > page_end.x
+                        || p1.y < page_pos.y
+                        || p0.y > page_end.y
+                    {
+                        continue;
+                    }
+                    let title_font_size = label.size.y * 0.35;
+                    texts.push(PrintableText {
+                        size: title_font_size,
+                        pos: Vector2::new(
+                            (sep_x + p1.x) / 2.0 - page_pos.x,
+                            (p0.y + p1.y) / 2.0 - page_pos.y,
+                        ),
+                        angle: Rad(0.0),
+                        align: TextAlign::Center,
+                        text: label.title.clone(),
+                    });
+                }
+
                 if edge_id_position != EdgeIdPosition::None {
                     let in_page = options.is_in_page_fn(page);
                     for (i_island, lines) in &lines_by_island {
