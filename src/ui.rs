@@ -2600,7 +2600,11 @@ impl PapercraftContext {
     pub fn do_auto_unfold(&mut self) -> RebuildFlags {
         let (prev_edges, prev_island_states) = self.papercraft.snapshot();
         self.papercraft.auto_unfold();
+        // Pack islands as part of the operation but track their pre-pack positions
+        // separately so "Repack pieces" can work from natural positions afterwards.
         let pack_undo = self.pack_islands();
+        // The AutoUnfold snapshot captures the full pre-unfold state; the
+        // IslandMove actions let Ctrl-Z also undo the automatic repack step.
         let mut undo = vec![UndoAction::AutoUnfold {
             prev_edges,
             prev_island_states,
@@ -2608,7 +2612,8 @@ impl PapercraftContext {
         undo.extend(pack_undo);
         self.push_undo_action(undo);
         self.check_selection();
-        RebuildFlags::PAPER | RebuildFlags::SCENE_EDGE | RebuildFlags::SELECTION | RebuildFlags::ISLANDS
+        // Force a complete redraw: flap geometry, paper FBO, scene edges, page layout.
+        RebuildFlags::all()
     }
 
     pub fn pre_selection_rectangle(&self) -> Option<Rectangle> {

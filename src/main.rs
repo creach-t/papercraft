@@ -2050,7 +2050,13 @@ impl GlobalContext {
                     if ui.menu_item_config(lbl(tr!("Repack pieces"))).build() {
                         let undo = self.data.pack_islands();
                         self.data.push_undo_action(undo);
-                        self.add_rebuild(RebuildFlags::PAPER | RebuildFlags::SELECTION);
+                        self.add_rebuild(
+                            RebuildFlags::PAPER
+                                | RebuildFlags::PAPER_FBO
+                                | RebuildFlags::PAGES
+                                | RebuildFlags::ISLANDS
+                                | RebuildFlags::SELECTION,
+                        );
                     }
 
                     ui.separator();
