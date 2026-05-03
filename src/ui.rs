@@ -32,7 +32,7 @@ use crate::{
     paper::{
         EdgeId, EdgeIdPosition, EdgeIndex, EdgeStatus, EdgeToggleFlapAction, Face, FaceIndex,
         FlapGeom, FlapSide, FlapStyle, FoldStyle, IslandKey, JoinResult, LabelKey,
-        MaterialIndex, Model, PaperOptions, Papercraft,
+        MaterialIndex, Model, PaperOptions, Papercraft, RealEdgeStatus,
     },
     printable_island_name,
 };
@@ -115,6 +115,10 @@ pub enum UndoAction {
     DocConfig {
         options: Box<PaperOptions>,
         island_pos: FxHashMap<FaceIndex, (Rad<f32>, Vector2)>,
+    },
+    AutoUnfold {
+        prev_edges: Vec<RealEdgeStatus>,
+        prev_island_states: Vec<(FaceIndex, Rad<f32>, Vector2, String)>,
     },
     Modified,
 }
@@ -2592,6 +2596,21 @@ impl PapercraftContext {
             | RebuildFlags::ISLANDS
     }
 
+    #[must_use]
+    pub fn do_auto_unfold(&mut self) -> RebuildFlags {
+        let (prev_edges, prev_island_states) = self.papercraft.snapshot();
+        self.papercraft.auto_unfold();
+        let pack_undo = self.pack_islands();
+        let mut undo = vec![UndoAction::AutoUnfold {
+            prev_edges,
+            prev_island_states,
+        }];
+        undo.extend(pack_undo);
+        self.push_undo_action(undo);
+        self.check_selection();
+        RebuildFlags::PAPER | RebuildFlags::SCENE_EDGE | RebuildFlags::SELECTION | RebuildFlags::ISLANDS
+    }
+
     pub fn pre_selection_rectangle(&self) -> Option<Rectangle> {
         self.pre_selection
             .as_ref()
@@ -2675,6 +2694,15 @@ impl PapercraftContext {
                     island.reset_transformation(i_root_face, rot, loc);
                 }
                 Some(UndoResult::ModelAndOptions(options))
+            }
+            UndoAction::AutoUnfold {
+                prev_edges,
+                prev_island_states,
+            } => {
+                self.papercraft
+                    .restore_from_snapshot(prev_edges, prev_island_states);
+                self.check_selection();
+                Some(UndoResult::Model)
             }
             UndoAction::Modified => {
                 self.modified = false;
