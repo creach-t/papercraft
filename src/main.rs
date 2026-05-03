@@ -702,6 +702,7 @@ struct MenuActions {
     quit: BoolWithConfirm,
     reset_views: bool,
     undo: bool,
+    auto_unfold: bool,
 }
 
 // Returns `Some(true)` if "OK", `Some(false)`, if "Cancel" or not opened, `None` if opened.
@@ -2043,6 +2044,9 @@ impl GlobalContext {
 
                     ui.separator();
 
+                    if ui.menu_item_config(lbl(tr!("Auto unfold"))).build() {
+                        menu_actions.auto_unfold = true;
+                    }
                     if ui.menu_item_config(lbl(tr!("Repack pieces"))).build() {
                         let undo = self.data.pack_islands();
                         self.data.push_undo_action(undo);
@@ -2370,6 +2374,10 @@ impl GlobalContext {
     }
 
     fn run_menu_actions(&mut self, ui: &Ui, menu_actions: &MenuActions) {
+        if menu_actions.auto_unfold {
+            let rebuild = self.data.do_auto_unfold();
+            self.add_rebuild(rebuild);
+        }
         if menu_actions.reset_views {
             self.data.reset_views(self.sz_scene, self.sz_paper);
         }
