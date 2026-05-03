@@ -1592,6 +1592,68 @@ impl Papercraft {
         }
         page + 1
     }
+
+    /// Captures the current edge + island layout for undo purposes.
+    pub fn snapshot(&self) -> (Vec<RealEdgeStatus>, Vec<(FaceIndex, Rad<f32>, Vector2, String)>) {
+        let edges = self.edges.clone();
+        let islands = self
+            .islands
+            .values()
+            .map(|isl| (isl.root, isl.rot, isl.loc, isl.name.clone()))
+            .collect();
+        (edges, islands)
+    }
+
+    /// Restores a full state previously captured by `snapshot()`.
+    pub fn restore_from_snapshot(
+        &mut self,
+        edges: Vec<RealEdgeStatus>,
+        island_states: Vec<(FaceIndex, Rad<f32>, Vector2, String)>,
+    ) {
+        self.edges = edges;
+        self.islands.clear();
+        self.memo = Memoization::default();
+
+        // Rebuild islands: BFS over joined edges to find connected components,
+        // then restore position/rotation from the snapshot.
+        let mut pending: FxHashSet<FaceIndex> = self.model.faces().map(|(i, _)| i).collect();
+        for (root, rot, loc, name) in island_states {
+            if !pending.contains(&root) {
+                continue;
+            }
+            let _ = traverse_faces_ex(
+                &self.model,
+                root,
+                (),
+                NoMatrixTraverseFace(&self.edges),
+                |i_face, _, _| {
+                    pending.remove(&i_face);
+                    ControlFlow::Continue(())
+                },
+            );
+            let mut island = Island {
+                root,
+                rot,
+                loc,
+                mx: Matrix3::one(),
+                name,
+            };
+            island.recompute_matrix();
+            self.islands.insert(island);
+        }
+        // Orphan faces (snapshot was incomplete): give them dummy islands.
+        for root in pending {
+            let island = Island {
+                root,
+                rot: Rad::zero(),
+                loc: Vector2::zero(),
+                mx: Matrix3::one(),
+                name: String::new(),
+            };
+            self.islands.insert(island);
+        }
+    }
+
     // Returns the ((face, area), total_area)
     pub fn get_biggest_flat_face(&self, island: &Island) -> (Vec<(FaceIndex, f32)>, f32) {
         let mut biggest_face = None;
