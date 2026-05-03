@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::ops::ControlFlow;
 use std::{cell::RefCell, rc::Rc};
@@ -1652,6 +1653,87 @@ impl Papercraft {
             };
             self.islands.insert(island);
         }
+    }
+
+    /// Automatically unfolds the whole model from scratch.
+    ///
+    /// Cuts every internal edge, then greedily rejoins them with a BFS
+    /// while rejecting joins that would produce a self-intersecting island.
+    /// Returns the list of successful joins (used to build undo actions).
+    pub fn auto_unfold(&mut self) -> Vec<JoinResult> {
+        // Cut all joined edges (keep Hidden as-is).
+        for i in 0..self.edges.len() {
+            if matches!(self.edges[i], RealEdgeStatus::Joined) {
+                self.edges[i] = RealEdgeStatus::Cut(FlapSide::False);
+            }
+        }
+
+        // One island per face, all at the origin (pack_islands will arrange them).
+        self.islands.clear();
+        self.memo = Memoization::default();
+        for (i_face, _) in self.model.faces() {
+            let island = Island {
+                root: i_face,
+                rot: Rad::zero(),
+                loc: Vector2::zero(),
+                mx: Matrix3::one(),
+                name: String::new(),
+            };
+            self.islands.insert(island);
+        }
+
+        // Collect all face indices upfront to avoid borrow conflicts.
+        let all_faces: Vec<FaceIndex> = self.model.faces().map(|(i, _)| i).collect();
+
+        // BFS over faces: try to join each reachable edge.
+        let mut join_results = Vec::new();
+        let mut visited: FxHashSet<FaceIndex> = FxHashSet::default();
+        let mut queue: VecDeque<FaceIndex> = VecDeque::new();
+
+        for start_face in all_faces {
+            if !visited.insert(start_face) {
+                continue;
+            }
+            queue.push_back(start_face);
+
+            while let Some(current_face) = queue.pop_front() {
+                let edges = self.model[current_face].index_edges();
+                for i_edge in edges {
+                    if matches!(self.edges[usize::from(i_edge)], RealEdgeStatus::Hidden) {
+                        continue;
+                    }
+                    let (fa, fb) = self.model[i_edge].faces();
+                    let other_face = if fa == current_face {
+                        match fb {
+                            Some(f) => f,
+                            None => continue,
+                        }
+                    } else {
+                        fa
+                    };
+
+                    if !visited.insert(other_face) {
+                        continue; // Already part of the BFS tree
+                    }
+
+                    let r = self.edge_join(i_edge, Some(current_face));
+                    if let Some(join_r) = r {
+                        let new_island = self.island_by_face(current_face);
+                        if self.island_is_self_intersecting(new_island) {
+                            self.edge_undo_join(&join_r);
+                            visited.remove(&other_face); // allow retrying from another path
+                        } else {
+                            join_results.push(join_r);
+                            queue.push_back(other_face);
+                        }
+                    } else {
+                        visited.remove(&other_face);
+                    }
+                }
+            }
+        }
+
+        join_results
     }
 
     // Returns the ((face, area), total_area)
