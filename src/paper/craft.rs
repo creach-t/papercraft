@@ -525,6 +525,13 @@ impl Memoization {
         self.flat_face_flap_dimensions.borrow_mut().clear();
         self.island_perimeters.borrow_mut().clear();
     }
+    // Call this after moving/rotating islands without changing their topology.
+    // Island perimeters and flap dimensions are stored in paper-space coordinates,
+    // so they become stale when islands are repositioned.
+    fn invalidate_island_positions(&self) {
+        self.flat_face_flap_dimensions.borrow_mut().clear();
+        self.island_perimeters.borrow_mut().clear();
+    }
     fn invalidate_islands(&self, islands: &[IslandKey]) {
         self.island_by_face.borrow_mut().clear();
 
@@ -1590,6 +1597,9 @@ impl Papercraft {
             island.rot += angle;
             island.recompute_matrix();
         }
+        // Island positions and rotations changed: perimeter and flap-dimension
+        // caches are in paper-space and must be recomputed on the next render.
+        self.memo.invalidate_island_positions();
         page + 1
     }
 
