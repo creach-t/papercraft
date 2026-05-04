@@ -1680,12 +1680,42 @@ impl Papercraft {
             }
         }
 
-        // One island per face, all at the origin.
+        // One island per Hidden-edge connected component.
+        //
+        // Both NormalTraverseFace (rendering) and NoMatrixTraverseFace
+        // (island_by_face) cross Hidden edges as well as Joined edges.
+        // If we created one island per face, faces linked by a Hidden edge
+        // would each start their own island but both traversals would visit
+        // the neighbour, causing every such face to be rendered twice and
+        // producing duplicate flaps.  Grouping them up-front avoids this.
         self.islands.clear();
         self.memo = Memoization::default();
-        for (i_face, _) in self.model.faces() {
+        let mut visited: FxHashSet<FaceIndex> = FxHashSet::default();
+        for (i_start, _) in self.model.faces() {
+            if !visited.insert(i_start) {
+                continue; // already part of a previously created island
+            }
+            // BFS through Hidden edges to collect the whole component.
+            let mut stack = vec![i_start];
+            let mut qi = 0;
+            while qi < stack.len() {
+                let i_face = stack[qi];
+                qi += 1;
+                for i_edge in self.model[i_face].index_edges() {
+                    if !matches!(self.edges[usize::from(i_edge)], RealEdgeStatus::Hidden) {
+                        continue;
+                    }
+                    let (fa, fb) = self.model[i_edge].faces();
+                    for neighbor in std::iter::once(fa).chain(fb) {
+                        if visited.insert(neighbor) {
+                            stack.push(neighbor);
+                        }
+                    }
+                }
+            }
+            // One island per component, rooted at the component's first face.
             self.islands.insert(Island {
-                root: i_face,
+                root: i_start,
                 rot: Rad::zero(),
                 loc: Vector2::zero(),
                 mx: Matrix3::one(),
