@@ -525,6 +525,13 @@ impl Memoization {
         self.flat_face_flap_dimensions.borrow_mut().clear();
         self.island_perimeters.borrow_mut().clear();
     }
+    // Call this after moving/rotating islands without changing their topology.
+    // Island perimeters and flap dimensions are stored in paper-space coordinates,
+    // so they become stale when islands are repositioned.
+    fn invalidate_island_positions(&self) {
+        self.flat_face_flap_dimensions.borrow_mut().clear();
+        self.island_perimeters.borrow_mut().clear();
+    }
     fn invalidate_islands(&self, islands: &[IslandKey]) {
         self.island_by_face.borrow_mut().clear();
 
@@ -1590,8 +1597,176 @@ impl Papercraft {
             island.rot += angle;
             island.recompute_matrix();
         }
+        // Island positions and rotations changed: perimeter and flap-dimension
+        // caches are in paper-space and must be recomputed on the next render.
+        self.memo.invalidate_island_positions();
         page + 1
     }
+
+    /// Captures the current edge + island layout for undo purposes.
+    pub fn snapshot(&self) -> (Vec<RealEdgeStatus>, Vec<(FaceIndex, Rad<f32>, Vector2, String)>) {
+        let edges = self.edges.clone();
+        let islands = self
+            .islands
+            .values()
+            .map(|isl| (isl.root, isl.rot, isl.loc, isl.name.clone()))
+            .collect();
+        (edges, islands)
+    }
+
+    /// Restores a full state previously captured by `snapshot()`.
+    pub fn restore_from_snapshot(
+        &mut self,
+        edges: Vec<RealEdgeStatus>,
+        island_states: Vec<(FaceIndex, Rad<f32>, Vector2, String)>,
+    ) {
+        self.edges = edges;
+        self.islands.clear();
+        self.memo = Memoization::default();
+
+        // Rebuild islands: BFS over joined edges to find connected components,
+        // then restore position/rotation from the snapshot.
+        let mut pending: FxHashSet<FaceIndex> = self.model.faces().map(|(i, _)| i).collect();
+        for (root, rot, loc, name) in island_states {
+            if !pending.contains(&root) {
+                continue;
+            }
+            let _ = traverse_faces_ex(
+                &self.model,
+                root,
+                (),
+                NoMatrixTraverseFace(&self.edges),
+                |i_face, _, _| {
+                    pending.remove(&i_face);
+                    ControlFlow::Continue(())
+                },
+            );
+            let mut island = Island {
+                root,
+                rot,
+                loc,
+                mx: Matrix3::one(),
+                name,
+            };
+            island.recompute_matrix();
+            self.islands.insert(island);
+        }
+        // Orphan faces (snapshot was incomplete): give them dummy islands.
+        for root in pending {
+            let island = Island {
+                root,
+                rot: Rad::zero(),
+                loc: Vector2::zero(),
+                mx: Matrix3::one(),
+                name: String::new(),
+            };
+            self.islands.insert(island);
+        }
+    }
+
+    /// Automatically unfolds the whole model from scratch.
+    ///
+    /// Resets all edges to Cut, then uses a Kruskal-style greedy spanning
+    /// tree to rejoin them in order of increasing dihedral angle (flattest
+    /// edges first).  Flat joins produce large, low-curvature islands that
+    /// are easier to cut out; the remaining cuts fall on sharper creases
+    /// that are natural fold/glue lines.  Joins that would cause
+    /// self-intersection are skipped.
+    pub fn auto_unfold(&mut self) -> Vec<JoinResult> {
+        // Cut all joined edges (keep Hidden as-is).
+        for i in 0..self.edges.len() {
+            if matches!(self.edges[i], RealEdgeStatus::Joined) {
+                self.edges[i] = RealEdgeStatus::Cut(FlapSide::False);
+            }
+        }
+
+        // One island per Hidden-edge connected component.
+        //
+        // Both NormalTraverseFace (rendering) and NoMatrixTraverseFace
+        // (island_by_face) cross Hidden edges as well as Joined edges.
+        // If we created one island per face, faces linked by a Hidden edge
+        // would each start their own island but both traversals would visit
+        // the neighbour, causing every such face to be rendered twice and
+        // producing duplicate flaps.  Grouping them up-front avoids this.
+        self.islands.clear();
+        self.memo = Memoization::default();
+        let mut visited: FxHashSet<FaceIndex> = FxHashSet::default();
+        for (i_start, _) in self.model.faces() {
+            if !visited.insert(i_start) {
+                continue; // already part of a previously created island
+            }
+            // BFS through Hidden edges to collect the whole component.
+            let mut stack = vec![i_start];
+            let mut qi = 0;
+            while qi < stack.len() {
+                let i_face = stack[qi];
+                qi += 1;
+                for i_edge in self.model[i_face].index_edges() {
+                    if !matches!(self.edges[usize::from(i_edge)], RealEdgeStatus::Hidden) {
+                        continue;
+                    }
+                    let (fa, fb) = self.model[i_edge].faces();
+                    for neighbor in std::iter::once(fa).chain(fb) {
+                        if visited.insert(neighbor) {
+                            stack.push(neighbor);
+                        }
+                    }
+                }
+            }
+            // One island per component, rooted at the component's first face.
+            self.islands.insert(Island {
+                root: i_start,
+                rot: Rad::zero(),
+                loc: Vector2::zero(),
+                mx: Matrix3::one(),
+                name: String::new(),
+            });
+        }
+
+        // Collect all candidate edges (internal, non-hidden) and sort them
+        // by ascending absolute dihedral angle: nearly-coplanar (tessellation
+        // seams, broad curves) are joined first, then moderate folds; very
+        // sharp creases are tried last and will more likely stay as cuts.
+        let mut candidates: Vec<(EdgeIndex, f32)> = self
+            .model
+            .edges()
+            .filter_map(|(i_edge, edge)| {
+                if edge.faces().1.is_none() {
+                    return None; // rim edge
+                }
+                if matches!(self.edges[usize::from(i_edge)], RealEdgeStatus::Hidden) {
+                    return None;
+                }
+                Some((i_edge, edge.angle().0.abs()))
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Kruskal-style greedy spanning forest.
+        let mut join_results = Vec::new();
+        for (i_edge, _angle) in candidates {
+            let (fa, fb) = self.model[i_edge].faces();
+            let fb = fb.unwrap(); // guaranteed by filter_map above
+
+            // Skip if both faces are already in the same island (would form a cycle).
+            if self.island_by_face(fa) == self.island_by_face(fb) {
+                continue;
+            }
+
+            let r = self.edge_join(i_edge, None);
+            if let Some(join_r) = r {
+                let new_island = self.island_by_face(fa);
+                if self.island_is_self_intersecting(new_island) {
+                    self.edge_undo_join(&join_r);
+                } else {
+                    join_results.push(join_r);
+                }
+            }
+        }
+
+        join_results
+    }
+
     // Returns the ((face, area), total_area)
     pub fn get_biggest_flat_face(&self, island: &Island) -> (Vec<(FaceIndex, f32)>, f32) {
         let mut biggest_face = None;
