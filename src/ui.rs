@@ -1277,6 +1277,16 @@ impl PapercraftContext {
             let mut lines_label: Vec<Line2D> = Vec::new();
             let mut vertices_label_thumb: Vec<MVertexText> = Vec::new();
             // Title text goes in its own buffer so it renders regardless of show_texts
+
+            // Compute model dimensions once for all labels
+            let model_dims_text = {
+                let (v_min, v_max) = util_3d::bounding_box_3d(
+                    self.papercraft.model().vertices().map(|(_, v)| v.pos()),
+                );
+                let s = self.papercraft.options().scale;
+                let d = (v_max - v_min) * s;
+                tr!("W:{:.0}  H:{:.0}  D:{:.0}  mm", d.x, d.y, d.z)
+            };
             let mut vertices_label_text: Vec<(TextureUniqueId, Vec<MVertexText>)> = Vec::new();
 
             let has_thumb = self.gl_objs.label_thumbnail_tex.is_some();
@@ -1320,19 +1330,26 @@ impl PapercraftContext {
                     Vector2::new(sep_x, p1.y),
                 ));
 
-                // Title: large, centered vertically in the right zone
-                let title_font_size = label.size.y * 0.35;
+                // Title + dimensions stacked in the right zone
+                let cx = (sep_x + p1.x) / 2.0;
+                let title_font_size = label.size.y * 0.28;
+                let dims_font_size = label.size.y * 0.16;
                 let title_text = PrintableText {
                     size: title_font_size,
-                    pos: Vector2::new(
-                        (sep_x + p1.x) / 2.0,
-                        (p0.y + p1.y) / 2.0,
-                    ),
+                    pos: Vector2::new(cx, p0.y + label.size.y * 0.38),
                     angle: Rad(0.0),
                     align: TextAlign::Center,
                     text: label.title.clone(),
                 };
                 text_builder.make_text(&title_text, &mut vertices_label_text);
+                let dims_text = PrintableText {
+                    size: dims_font_size,
+                    pos: Vector2::new(cx, p0.y + label.size.y * 0.65),
+                    angle: Rad(0.0),
+                    align: TextAlign::Center,
+                    text: model_dims_text.clone(),
+                };
+                text_builder.make_text(&dims_text, &mut vertices_label_text);
 
                 // Thumbnail: square on the left side
                 if has_thumb {

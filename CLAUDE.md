@@ -11,6 +11,7 @@ Ce fichier aide les agents IA à comprendre rapidement l'architecture du projet 
 - Fork de travail : https://github.com/creach-t/papercraft
 - Original upstream : https://github.com/rodrigorc/papercraft
 - Branche principale des modifications : `feature/3d-views-pdf`
+- Version : 2.11.0
 
 ---
 
@@ -58,15 +59,21 @@ Le patch est dans `E:\Projets\papercraft-maker\include-po-patch\src\lib.rs` — 
 
 | Fichier | Rôle |
 |---|---|
-| `main.rs` | Point d'entrée, boucle événements, `GlobalContext`, actions fichier, exports |
-| `ui.rs` | `PapercraftContext`, rendu, flags rebuild, gestion modèle/GPU |
-| `printable.rs` | Export PDF/SVG/PNG (pages imprimables) |
-| `util_gl.rs` | Vertex types, uniforms, macros OpenGL |
+| `main.rs` (≈4929 l.) | Point d'entrée, boucle événements, `GlobalContext`, actions fichier, exports |
+| `ui.rs` (≈1900 l.) | `PapercraftContext`, rendu, flags rebuild, gestion modèle/GPU |
+| `printable.rs` (≈650 l.) | Export PDF/SVG/PNG (pages imprimables) |
+| `util_gl.rs` | Vertex types (`MVertex3D`, `MVertex2D`, etc.), uniforms, macros OpenGL |
 | `util_3d.rs` | **Type aliases** : `Vector2/3`, `Matrix2/3/4`, `Quaternion`, `Point2/3` (tous `cgmath<f32>`) |
 | `pdf_metrics.rs` | Métriques Helvetica pour texte dans les PDF |
 | `config.rs` | Configuration utilisateur persistée en JSON |
-| `paper/` | Modèle de données pur (Papercraft, Island, PaperOptions, I/O) |
-| `paper/model/import/` | Importeurs : OBJ, GLTF, STL, Pepakura |
+| `paper.rs` | Ré-exports publics du module `paper::` |
+| `paper/craft.rs` (≈850 l.) | Struct `Papercraft`, options, îles, edges, labels utilisateur, noms d'îles |
+| `paper/craft/file.rs` | I/O sérialisation `.craft` (ZIP + JSON) |
+| `paper/craft/update.rs` | Mise à jour du modèle depuis imports OBJ/GLTF |
+| `paper/model.rs` (≈600 l.) | Struct `Model` (vertices, edges, faces, textures), calculs géométriques |
+| `paper/model/formats.rs` | Dispatcher import/export |
+| `paper/model/formats/{gltf,stl,waveobj,pepakura}/` | Importeurs spécialisés |
+| `viewer3d_template.html` (442 l.) | Template WebGL autonome (0 dépendance externe) |
 
 ### Types centraux
 
@@ -75,24 +82,78 @@ Le patch est dans `E:\Projets\papercraft-maker\include-po-patch\src\lib.rs` — 
 - Champs clés : `gl: GlContext`, `data: PapercraftContext`, `rebuild: RebuildFlags`
 - Gère : dialogs fichiers, messages d'erreur, config, version check
 
-**`PapercraftContext`** (`ui.rs`) — Couche données + GPU
-- Champs clés : `papercraft: Papercraft`, `gl_objs: GLObjects`, `ui: UiSettings`
-- Gère : sélection, historique undo, positions des îles, grab states
+**`PapercraftContext`** (`ui.rs:159`) — Couche données + GPU
+```rust
+pub struct PapercraftContext {
+    papercraft: Papercraft,
+    gl_objs: GLObjects,
+    undo_stack: Vec<Vec<UndoAction>>,
+    selected_face: Option<FaceIndex>,
+    selected_edges: Option<FxHashSet<EdgeIndex>>,
+    selected_islands: Vec<IslandFaceKey>,
+    grabbed_label: Option<(LabelKey, Vector2)>,  // label en cours de drag
+    pub ui: UiSettings,
+}
+```
+
+**`UiSettings`** (`ui.rs:192`)
+```rust
+pub struct UiSettings {
+    pub mode: MouseMode,
+    pub trans_scene: Transformation3D,
+    pub trans_paper: TransformationPaper,
+    pub show_textures: bool,
+    pub show_flaps: bool,
+    pub show_3d_lines: bool,   // ← à réactiver après prepare_thumbnail()
+    pub xray_selection: bool,
+    pub show_texts: bool,
+    pub highlight_overlaps: bool,
+    pub draw_paper: bool,
+}
+```
+
+**`Transformation3D`** (`ui.rs:208`) — Caméra vue 3D
+```rust
+pub struct Transformation3D {
+    pub location: Vector3,
+    pub rotation: Quaternion,
+    pub scale: f32,
+    pub obj: Matrix4,    // normalisation modèle (centrage + scale à 1 unité)
+    pub persp: Matrix4,  // focal = persp[1][1]
+    pub view: Matrix4,
+    pub mnormal: Matrix3,
+}
+```
 
 **`RebuildFlags`** (`ui.rs`) — Dirty flags bitflags pour rendu incrémental
 - `self.add_rebuild(RebuildFlags::SCENE_FBO | RebuildFlags::PAPER)` pour signaler un changement
 - Checké dans la boucle de rendu pour ne reconstruire que ce qui est nécessaire
 
-**`FileAction`** (`main.rs`) — Enum des opérations fichier
+**`FileAction`** (`main.rs:441`) — Enum des opérations fichier
 ```rust
 enum FileAction {
-    OpenCraft, OpenCraftReadOnly, SaveAsCraft,
-    ImportModel, UpdateObj, ExportObj,
-    GeneratePrintable(FileFormat),
-    Generate3dPdf,  // ← ajouté dans ce fork
+    OpenCraft,
+    OpenCraftReadOnly,
+    SaveAsCraft,
+    ImportModel,
+    UpdateObj,
+    ExportObj,
+    GeneratePrintable,
+    Generate3dPdf,              // ← ajouté dans ce fork
+    GenerateInteractive3dPdf,   // ← ajouté dans ce fork
 }
 ```
 Pour ajouter une action : implémenter `title()` et `is_save()`, ajouter le dispatch dans `do_file_action()`.
+
+**`Label`** (`paper/craft.rs:119`) — Labels utilisateur libres (pas les vues 3D)
+```rust
+pub struct Label {
+    pub pos: Vector2,    // coordonnées papier en mm
+    pub size: Vector2,
+    pub title: String,
+}
+```
+Sérialisés dans `.craft`, éditables dans l'UI. Itérateur : `papercraft.labels()`.
 
 ---
 
@@ -181,7 +242,7 @@ doc.reference_table.cross_reference_type = XrefType::CrossReferenceTable;
 
 ## Localisation (i18n)
 
-- Fichiers `.po` dans `locales/`
+- Fichiers `.po` dans `locales/` (EN, ES)
 - Macro `tr!("texte")` pour les chaînes traduisibles
 - Généré au build via `include_po` → `OUT_DIR/locale/translators.rs`
 - Initialisation dans `main()` via `translators::set_locale(...)`
@@ -190,34 +251,52 @@ doc.reference_table.cross_reference_type = XrefType::CrossReferenceTable;
 
 ## Fonctionnalités ajoutées dans ce fork
 
-### Export PDF 3D views (`feature/3d-views-pdf`)
-**Fichier** : `src/main.rs` — fonction `generate_3d_pdf_views()`
+### Export PDF 6 vues (`feature/3d-views-pdf`)
+**Fichier** : `src/main.rs:3511-3825` — fonction `generate_3d_pdf_views()`
 
-Génère un PDF A4 paysage avec 6 vues du modèle assemblé (Front/Back/Left/Right/Top/Bottom) en grille 3×2 pour aider à l'assemblage.
+Génère un PDF A4 paysage (841.89×595.28 pts) avec 6 vues du modèle assemblé (grille 3×2).
 
 - Menu : *File → Export 3D Views PDF...*
 - Rendu : FBO OpenGL 512×512 px par vue, 6 rotations de caméra
-- PDF : lopdf, compression parallèle rayon, titre centré
-- Fond blanc, lignes de découpe en bleu (couleur hardcodée pour le PDF, restaurée après)
-- Pas de labels de vue (Front/Back/…) dans le PDF final
-- Scale auto-fit exact par vue : formule perspective `S = fill * camera_dist / (|rv.x| * focal + fill * rv.z)`, minimum sur tous les sommets → modèle remplit ~92% de chaque cellule sans déborder
+- PDF : lopdf, compression parallèle rayon, titre centré (Helvetica 14pt)
+- Fond blanc, arêtes de découpe en bleu hardcodé `(0.18, 0.45, 1.0, 1.0)`
 
-#### Points d'attention pour modifier cette fonction
+#### Vues et rotations (`main.rs:3523-3532`)
+```rust
+let views: &[(&str, Option<(V3, f32)>)] = &[
+    ("Front",  None),
+    ("Back",   Some((V3::new(0.0, 1.0, 0.0), 180.0))),
+    ("Right",  Some((V3::new(0.0, 1.0, 0.0), -90.0))),
+    ("Left",   Some((V3::new(0.0, 1.0, 0.0),  90.0))),
+    ("Top",    Some((V3::new(1.0, 0.0, 0.0), -90.0))),
+    ("Bottom", Some((V3::new(1.0, 0.0, 0.0),  90.0))),
+];
+```
+Les strings ("Front", "Back"…) sont définies ici. Si les labels sont affichés dans le PDF, c'est via ces strings — vérifier dans la fonction si elles sont passées à lopdf.
 
-**Couleur des lignes de découpe**
-`prepare_thumbnail()` désactive `show_3d_lines`. Il faut le réactiver juste après :
+#### Disposition PDF
+- Margin : 18 pt, Gap : 8 pt entre cellules
+- Titre en haut (22 pt de hauteur)
+- Cellules carrées, grille 3 cols × 2 rangées
+
+#### Points d'attention
+
+**Couleur des arêtes de découpe** — `prepare_thumbnail()` désactive `show_3d_lines`. Réactiver juste après :
 ```rust
 let thumb_data = self.data.prepare_thumbnail(...);
 self.data.ui.show_3d_lines = true;
 ```
-La couleur est injectée via `options_mut().line3d_cut.color` avant `pre_render`, puis restaurée après le rendu.
-
-**Auto-scale perspective-correct**
-Pour chaque vue, après avoir fixé la rotation :
+Override couleur avant `pre_render`, restaurer après :
 ```rust
-// Vertices normalisés = après obj (centrage + normalisation à 1 unité), avant rotation/scale
-// rv = rot_mat * v_normalized
-// S = fill * camera_dist / (|rv.proj| * focal + fill * rv.z)   (min sur tous les sommets)
+self.data.papercraft_mut().options_mut().line3d_cut.color =
+    imgui::Color::new(0.18, 0.45, 1.0, 1.0);
+// ... rendu ...
+self.data.papercraft_mut().options_mut().line3d_cut.color = orig_cut_color;
+```
+
+**Auto-scale perspective-correct** (`main.rs:3607-3630`)
+```rust
+// focal = persp[1][1], camera_dist = 30.0, fill = 0.92
 let tight_scale = normalized_verts.iter().fold(f32::INFINITY, |min_s, v| {
     let rv = rot_mat * *v;
     let lim = |proj: f32| {
@@ -229,11 +308,77 @@ let tight_scale = normalized_verts.iter().fold(f32::INFINITY, |min_s, v| {
 self.data.ui.trans_scene.scale = tight_scale;
 self.data.ui.trans_scene.recompute_obj();
 ```
-`focal = persp[1][1]`, `camera_dist = -location.z = 30.0`.
+Modèle remplit ~92% de chaque cellule sans déborder.
 
-**Nouvelles méthodes ajoutées**
-- `Papercraft::options_mut()` (`paper/craft.rs`) — accès mutable aux options sans passer par `set_options`
-- `PapercraftContext::papercraft_mut()` (`ui.rs`) — accès mutable au papercraft sous-jacent
+---
+
+### Export visionneuse 3D interactive (.html) (`feature/interactive-3d-pdf`)
+**Fichiers** : `src/main.rs:3829-3985` — `generate_interactive_3d_pdf()` + `src/viewer3d_template.html`
+
+Génère un fichier `.html` autonome (zéro dépendance externe) avec une visionneuse 3D WebGL.
+
+- Menu : *File → Export Interactive 3D Viewer (.html)...*
+- Contrôles : left-drag rotation, right-drag pan, scroll zoom, touch support
+- Arêtes de découpe affichées en bleu (#2488FF)
+- Survol pièce → highlight jaune dans vue 3D + panneau 2D (layout plat + nom de la pièce)
+
+#### Noms d'îles
+```rust
+self.data.papercraft_mut().rebuild_island_names();  // assigne A, B, C, ..., Z, AA, AB, ...
+```
+`rebuild_island_names()` (`paper/craft.rs:752`) : trie les îles par aire décroissante.
+
+#### Architecture des données exportées
+
+| Variable JS | Contenu | Stride |
+|---|---|---|
+| `VERTS` | `Float32Array` — `[x3d, y3d, z3d, r, g, b, island_f]` × 3 vertices/face | 7 floats = 28 bytes |
+| `EDGES` | `Float32Array` — `[x3d, y3d, z3d]` × 2 endpoints/arête coupée | 3 floats = 12 bytes |
+| `ISLANDS` | JS array — `{name: str, flat: [...]}` par île | — |
+| `ISLANDS[i].flat` | `[x0,y0, x1,y1, x2,y2, r,g,b, ...]` — 9 floats/triangle | 9 floats |
+
+Couleur des faces : échantillonnée à l'UV centre de chaque face, sinon gris (0.78, 0.78, 0.78).
+
+#### Remplacement dans le template
+```rust
+let html = include_str!("viewer3d_template.html")
+    .replace("__TITLE__", &title)
+    .replace("__VERTS__", &js_verts)
+    .replace("__EDGES__", &js_edges)
+    .replace("__ISLANDS__", &js_islands);
+```
+Pas de `format!` Rust — les accolades JS ne posent pas de problème.
+
+#### Architecture `viewer3d_template.html`
+
+**Shaders WebGL** :
+- VS/FS mesh (`VS_MESH`/`FS_MESH_D`) : lighting via dérivées (`GL_OES_standard_derivatives`), fallback flat shading
+- VS/FS edge (`VS_EDGE`/`FS_EDGE`) : lignes bleu `#2488FF`
+- Highlight survol : `mix(aCol, aCol + vec3(0.28, 0.28, 0.06), h)` (teinte jaune si island hover)
+
+**Raycast CPU — Möller–Trumbore** (ligne ≈194) :
+- Parcourt tous les triangles de `VERTS` à chaque `mousemove`
+- Ray vers model space : `rot^T × ray_eye`, origine : `rot^T × (-panX, -panY, zoom)`
+
+**Panneau 2D** (ligne ≈255) :
+- Canvas 2D dédié, fit per-island dans 220×220px
+- Dessine triangles colorées + arêtes noires/blanches selon luminance
+
+**High-DPI** :
+```javascript
+const dpr = window.devicePixelRatio || 1;
+canvas.width = Math.round(canvas.clientWidth * dpr);
+```
+
+---
+
+## Nouvelles méthodes ajoutées dans ce fork
+
+| Méthode | Fichier | Rôle |
+|---|---|---|
+| `Papercraft::options_mut()` | `paper/craft.rs:568` | Accès mutable aux options sans passer par `set_options` |
+| `Papercraft::rebuild_island_names()` | `paper/craft.rs:752` | Assigne noms A/B/C… aux îles par aire décroissante |
+| `PapercraftContext::papercraft_mut()` | `ui.rs:594` | Accès mutable au `Papercraft` sous-jacent |
 
 ---
 
@@ -242,3 +387,31 @@ self.data.ui.trans_scene.recompute_obj();
 1. **Ressources Windows** : compile `res/resource.rc` si `WINDRES` ou `RC` est défini (skip gracieux sinon)
 2. **Métriques Helvetica** : parse `thirdparty/afm/Helvetica.afm` → génère `helvetica_afm.rs`
 3. **Locales** : génère `locale/translators.rs` depuis les fichiers `.po`
+
+---
+
+## Dépendances clés (`Cargo.toml`)
+
+| Crate | Version | Rôle |
+|---|---|---|
+| `cgmath` | 0.18 | Vecteurs/matrices (`Vector3`, `Matrix4`, `Quaternion`) |
+| `easy-imgui-window` | 0.22.0 | Fenêtre + ImGui + OpenGL context |
+| `easy-imgui-filechooser` | 0.5 | File dialogs |
+| `lopdf` | 0.40 | Génération PDF |
+| `image` | 0.25 | PNG/JPEG + `RgbaImage` |
+| `rayon` | 1 | Compression images en parallèle |
+| `zip` | 8.1.0 | Format `.craft` (ZIP + JSON) |
+| `serde` | 1 | Sérialisation modèles |
+| `slotmap` | 1 | `IslandKey`, `LabelKey`, `EdgeIndex`, etc. |
+| `tr` | 0.1.10 | Macro `tr!(...)` pour i18n |
+
+---
+
+## TODOs connus
+
+| Fichier | Ligne | Note |
+|---|---|---|
+| `main.rs` | 902 | `//TODO: list third party SW` (boîte About) |
+| `paper/craft.rs` | 440 | `#[serde(default)] //TODO: default not actually needed` |
+| `ui.rs` | 1230 | `//TODO PrintableTexts duplicated here and in generate_pages???` |
+| `paper/model/formats/pepakura/data.rs` | 167 | `//TODO mbcs?` (multi-byte charset, héritage) |
