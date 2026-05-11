@@ -10,7 +10,8 @@ Ce fichier aide les agents IA à comprendre rapidement l'architecture du projet 
 
 - Fork de travail : https://github.com/creach-t/papercraft
 - Original upstream : https://github.com/rodrigorc/papercraft
-- Branche principale des modifications : `feature/3d-views-pdf`
+- Branche principale du fork : `main` (toutes les features y sont mergées)
+- Branches feature archivées : `feature/3d-views-pdf`, `feature/interactive-3d-pdf`, `feature/auto-unfold`, `feature/label-etiquette`
 - Version : 2.11.0
 
 ---
@@ -154,6 +155,14 @@ pub struct Label {
 }
 ```
 Sérialisés dans `.craft`, éditables dans l'UI. Itérateur : `papercraft.labels()`.
+
+**Système de label thumbnail** (`main.rs`, `ui.rs`, `printable.rs`)
+- Créé via *Edit → Add label* : place un label en haut de la page 1, titre = nom du fichier modèle
+- La texture thumbnail (`GLObjects.label_thumbnail_tex`) est une render OpenGL 256×256 du modèle (vue isométrique), créée par `create_label_thumbnail()` (`main.rs:3392`)
+- Layout du label : thumbnail carrée à gauche | titre + dimensions à droite
+  - Titre centré à 38% de la hauteur, taille police 0.28×hauteur
+  - Dimensions `W:/H:/D: mm` (bounding box × scale) à 65% de la hauteur, taille 0.16×hauteur
+- Rendu dans `ui.rs:1268` (OpenGL) et `printable.rs:1145` (PDF/SVG vecteur)
 
 ---
 
@@ -409,9 +418,10 @@ canvas.width = Math.round(canvas.clientWidth * dpr);
 
 ## TODOs connus
 
-| Fichier | Ligne | Note |
-|---|---|---|
-| `main.rs` | 902 | `//TODO: list third party SW` (boîte About) |
-| `paper/craft.rs` | 440 | `#[serde(default)] //TODO: default not actually needed` |
-| `ui.rs` | 1230 | `//TODO PrintableTexts duplicated here and in generate_pages???` |
-| `paper/model/formats/pepakura/data.rs` | 167 | `//TODO mbcs?` (multi-byte charset, héritage) |
+| Fichier | Note |
+|---|---|
+| `main.rs:902` | `//TODO: list third party SW` (boîte About) |
+| `paper/craft.rs:440` | `#[serde(default)] //TODO: default not actually needed` |
+| `ui.rs` | `//TODO PrintableTexts duplicated here and in generate_pages???` |
+| `paper/model/formats/pepakura/data.rs:167` | `//TODO mbcs?` (multi-byte charset, héritage) |
+| `printable.rs:63` | `_edge_id_position` préfixé underscore — variable lue mais pas encore utilisée dans cette fonction |

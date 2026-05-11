@@ -60,7 +60,7 @@ impl GlobalContext {
 
         let options = self.data.papercraft().options();
         let page_size_mm = Vector2::from(options.page_size);
-        let edge_id_position = options.edge_id_position;
+        let _edge_id_position = options.edge_id_position;
         let (_, _, _, margin_bottom) = options.margin;
 
         let mut doc = Document::with_version("1.4");
