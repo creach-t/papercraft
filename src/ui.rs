@@ -1285,7 +1285,7 @@ impl PapercraftContext {
                 );
                 let s = self.papercraft.options().scale;
                 let d = (v_max - v_min) * s;
-                tr!("W:{:.0}  H:{:.0}  D:{:.0}  mm", d.x, d.y, d.z)
+                format!("W:{:.0}  H:{:.0}  D:{:.0}  mm", d.x, d.y, d.z)
             };
             let mut vertices_label_text: Vec<(TextureUniqueId, Vec<MVertexText>)> = Vec::new();
 

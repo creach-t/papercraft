@@ -1149,7 +1149,7 @@ impl GlobalContext {
                     );
                     let s = options.scale;
                     let d = (v_max - v_min) * s;
-                    tr!("W:{:.0}  H:{:.0}  D:{:.0}  mm", d.x, d.y, d.z)
+                    format!("W:{:.0}  H:{:.0}  D:{:.0}  mm", d.x, d.y, d.z)
                 };
                 for (_key, label) in self.data.papercraft().labels() {
                     let p0 = label.pos;
