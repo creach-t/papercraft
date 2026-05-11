@@ -228,18 +228,12 @@ impl GlobalContext {
             // Legend: colored line samples inside the label, below the dimensions
             {
                 struct Entry { r: f32, g: f32, b: f32, dashed: bool, label: String }
-                let cut  = options.cut_line_color.to_rgba();
                 let fold = options.fold_line_color.to_rgba();
-                let tab  = options.tab_line_color.to_rgba();
 
                 let mut entries: Vec<Entry> = Vec::new();
-                entries.push(Entry { r: cut.r,  g: cut.g,  b: cut.b,  dashed: false, label: tr!("Cut") });
                 if options.fold_style != FoldStyle::None {
                     entries.push(Entry { r: fold.r, g: fold.g, b: fold.b, dashed: true,  label: tr!("Valley fold") });
                     entries.push(Entry { r: fold.r, g: fold.g, b: fold.b, dashed: false, label: tr!("Mountain fold") });
-                }
-                if options.flap_style != FlapStyle::None {
-                    entries.push(Entry { r: tab.r,  g: tab.g,  b: tab.b,  dashed: false, label: tr!("Tab") });
                 }
 
                 let page_pos = options.page_position(page);
