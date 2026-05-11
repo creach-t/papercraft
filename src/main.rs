@@ -1612,12 +1612,22 @@ impl GlobalContext {
                                 "edgefont",
                             );
                             options.edge_id_font_size = options.edge_id_font_size.clamp(1.0, 72.0);
+                            ui.checkbox(
+                                lbl_id(tr!("Piece names only"), "only_islands"),
+                                &mut options.island_name_only,
+                            );
+                            build_length(
+                                ui,
+                                &mut options.label_tab_threshold,
+                                &tr!("Label on tab threshold"),
+                                &tr!("mm²"),
+                                0.0,
+                                font_sz * 3.0,
+                                "labtabthresh",
+                            );
+                            options.label_tab_threshold =
+                                options.label_tab_threshold.clamp(0.0, 10000.0);
                         });
-
-                        ui.checkbox(
-                            lbl_id(tr!("Piece names only"), "only_islands"),
-                            &mut options.island_name_only,
-                        );
                     });
                 ui.tree_node_config(lbl_id(tr!("Paper size"), "papersize"))
                     .flags(imgui::TreeNodeFlags::Framed)
@@ -2829,10 +2839,16 @@ impl GlobalContext {
         }
         let flags = match &self.paper_ui_status.action {
             Canvas3dAction::Hovering => self.data.paper_hover_event(self.sz_paper, mouse_pos, mods),
-            Canvas3dAction::Clicked(MouseButton::Left)
-            | Canvas3dAction::DoubleClicked(MouseButton::Left) => self
+            Canvas3dAction::Clicked(MouseButton::Left) => self.data.paper_button1_click_event(
+                self.sz_paper,
+                mouse_pos,
+                mods,
+                self.modifiable(),
+                false,
+            ),
+            Canvas3dAction::DoubleClicked(MouseButton::Left) => self
                 .data
-                .paper_button1_click_event(self.sz_paper, mouse_pos, mods, self.modifiable()),
+                .paper_button1_click_event(self.sz_paper, mouse_pos, mods, self.modifiable(), true),
             Canvas3dAction::Released(MouseButton::Left) => {
                 self.data
                     .paper_button1_release_event(self.sz_paper, mouse_pos, mods)
@@ -4543,8 +4559,35 @@ impl imgui::UiBuilder for Box<GlobalContext> {
     }
 }
 
-/// Computes the PrintableText for an island.
-/// The `contour` can be provided as an optimization.
+/// Returns the centroid of the largest tab on this island, if its area >= threshold.
+/// Returns `(base_mid, outward_dir, angle)` of the largest tab whose area >= threshold, or None.
+fn best_label_tab(
+    papercraft: &Papercraft,
+    i_island: IslandKey,
+    args: &PaperDrawFaceArgs,
+    cut_info: &[CutInfo],
+    threshold: f32,
+) -> Option<(Vector2, Vector2, Rad<f32>)> {
+    let perimeter = papercraft.island_perimeter(i_island);
+    let mut best_area = -1.0f32;
+    let mut best = None;
+    for peri in perimeter.iter() {
+        if let CutSource::FlapEdge(a, b, c) =
+            *cut_info[usize::from(peri.i_edge())].source_face_sign(peri.face_sign())
+        {
+            let (area, base_mid, outward, angle) = args.flap_tab_geometry(a, b, c);
+            if area > best_area {
+                best_area = area;
+                best = Some((base_mid, outward, angle));
+            }
+        }
+    }
+    if best_area >= threshold { best } else { None }
+}
+
+/// Computes the PrintableText for an island name.
+/// When `Outside` mode has no sufficiently large tab, adds a leader_end pointing
+/// to the nearest perimeter point so callers can draw a thin leader line.
 fn printable_island_name(
     papercraft: &Papercraft,
     i_island: IslandKey,
@@ -4555,30 +4598,42 @@ fn printable_island_name(
     let edge_id_font_size = options.edge_id_font_size * 25.4 / 72.0; // pt to mm
     let island = papercraft.island_by_key(i_island).unwrap();
 
-    let pos = match options.edge_id_position {
-        // On top (None should not happen)
+    // User-overridden position
+    if let Some(user_pos) = island.name_pos() {
+        return PrintableText {
+            size: 2.0 * edge_id_font_size,
+            pos: user_pos,
+            angle: Rad(0.0),
+            align: TextAlign::Center,
+            text: String::from(island.name()),
+        };
+    }
+
+    let (pos, angle) = match options.edge_id_position {
+        // Outside or None: try to place on the best tab, otherwise above the topmost point
         EdgeIdPosition::None | EdgeIdPosition::Outside => {
-            let mut top = Vector2::new(f32::MAX, f32::MAX);
-            let perimeter = papercraft.island_perimeter(i_island);
-            for peri in perimeter.iter() {
-                args.lines_by_cut_info(
-                    extra.cut_info().unwrap(),
-                    peri.i_edge(),
-                    peri.face_sign(),
-                    |p0, _| {
+            let cut_info = extra.cut_info().unwrap();
+            if let Some((base_mid, outward, tab_angle)) =
+                best_label_tab(papercraft, i_island, args, cut_info, options.label_tab_threshold)
+            {
+                let pos = base_mid + outward * edge_id_font_size;
+                (pos, tab_angle)
+            } else {
+                let mut top = Vector2::new(f32::MAX, f32::MAX);
+                let perimeter = papercraft.island_perimeter(i_island);
+                for peri in perimeter.iter() {
+                    args.lines_by_cut_info(cut_info, peri.i_edge(), peri.face_sign(), |p0, _| {
                         if p0.y < top.y {
                             top = p0;
                         }
-                    },
-                );
+                    });
+                }
+                (top - Vector2::new(0.0, edge_id_font_size), Rad(0.0))
             }
-            top - Vector2::new(0.0, edge_id_font_size)
         }
-        // In the middle
+        // Inside: center-of-mass, horizontal
         EdgeIdPosition::Inside => {
             let (flat_face, total_area) = papercraft.get_biggest_flat_face(island);
-            // Compute the center of mass of the flat-face, that will be the
-            // weighted mean of the centers of masses of each single face.
             let center: Vector2 = flat_face
                 .iter()
                 .map(|(i_face, area)| {
@@ -4586,15 +4641,14 @@ fn printable_island_name(
                     vv * *area
                 })
                 .sum();
-            // Don't forget to divide the center of each triangle by 3!
             let center = center / total_area / 3.0;
-            center + Vector2::new(0.0, edge_id_font_size)
+            (center + Vector2::new(0.0, edge_id_font_size), Rad(0.0))
         }
     };
     PrintableText {
         size: 2.0 * edge_id_font_size,
         pos,
-        angle: Rad(0.0),
+        angle,
         align: TextAlign::Center,
         text: String::from(island.name()),
     }

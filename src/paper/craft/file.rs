@@ -148,6 +148,7 @@ impl Papercraft {
                     rot: Rad::zero(),
                     mx: Matrix3::one(),
                     name: String::new(),
+                    name_pos: None,
                 });
                 self.memo = Memoization::default();
                 changed = true;
@@ -267,6 +268,7 @@ impl Papercraft {
                 rot: Rad::zero(),
                 mx: Matrix3::one(),
                 name: String::new(),
+                name_pos: None,
             };
             islands.insert(island);
         }

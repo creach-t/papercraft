@@ -185,6 +185,12 @@ pub struct PapercraftContext {
     // (key, paper-space cursor offset from label.pos at grab time)
     grabbed_label: Option<(LabelKey, Vector2)>,
 
+    // Island name drag interaction
+    // (island key, paper-space cursor offset from name_pos at grab time)
+    grabbed_island_name: Option<(IslandKey, Vector2)>,
+    // Cached (key, pos, size) populated during paper_rebuild for hit-testing
+    pub island_name_positions: Vec<(IslandKey, Vector2, f32)>,
+
     pub ui: UiSettings,
 }
 
@@ -458,6 +464,60 @@ impl PaperDrawFaceArgs {
             self.vertices[i0 + 2].pos_2d,
         ]
     }
+    /// Returns (area_mm2, centroid) for the tab triangle/trapezoid identified by flap-edge indices.
+    /// Returns `(area_mm2, base_mid, outward_dir, angle)` for a tab polygon.
+    ///
+    /// * `base_mid`   – midpoint of the tab's base edge (the cut edge on the island border).
+    /// * `outward_dir`– unit vector pointing from the base edge into the tab interior.
+    /// * `angle`      – direction of the base edge, clamped to `[-π/2, π/2]` (text never upside-down).
+    ///
+    /// Placement: `base_mid + outward_dir * offset` is always inside the tab regardless of its shape.
+    pub fn flap_tab_geometry(
+        &self,
+        a: usize,
+        b: Option<usize>,
+        c: usize,
+    ) -> (f32, Vector2, Vector2, Rad<f32>) {
+        let a0 = self.vertices_flap_edge[a].p0; // base-left  = pos0
+        let a1 = self.vertices_flap_edge[a].p1; // tip-left (or apex for triangle)
+        let c1 = self.vertices_flap_edge[c].p1; // base-right = pos1
+
+        let base_mid = (a0 + c1) / 2.0;
+
+        // Angle of the base edge, clamped to [-π/2, π/2] so text is never upside-down
+        let raw = Rad(f32::atan2(c1.y - a0.y, c1.x - a0.x));
+        let angle = if raw.0 > std::f32::consts::FRAC_PI_2 {
+            Rad(raw.0 - std::f32::consts::PI)
+        } else if raw.0 < -std::f32::consts::FRAC_PI_2 {
+            Rad(raw.0 + std::f32::consts::PI)
+        } else {
+            raw
+        };
+
+        if let Some(b) = b {
+            // Trapezoid: a0 → b0 → b1 → c1
+            let b0 = self.vertices_flap_edge[b].p0;
+            let b1 = self.vertices_flap_edge[b].p1;
+            let cross = |p: Vector2, q: Vector2| p.x * q.y - p.y * q.x;
+            let area =
+                (cross(a0, b0) + cross(b0, b1) + cross(b1, c1) + cross(c1, a0)).abs() / 2.0;
+            let tip_mid = (b0 + b1) / 2.0;
+            let toward_tip = tip_mid - base_mid;
+            let len = toward_tip.magnitude();
+            let outward = if len > 1e-6 { toward_tip / len } else { Vector2::unit_y() };
+            (area, base_mid, outward, angle)
+        } else {
+            // Triangle: a0, a1 (apex), c1
+            let v1 = a1 - a0;
+            let v2 = c1 - a0;
+            let area = (v1.x * v2.y - v1.y * v2.x).abs() / 2.0;
+            let toward_tip = a1 - base_mid;
+            let len = toward_tip.magnitude();
+            let outward = if len > 1e-6 { toward_tip / len } else { Vector2::unit_y() };
+            (area, base_mid, outward, angle)
+        }
+    }
+
     pub fn lines_by_cut_info<F>(
         &self,
         cut_info: &[CutInfo],
@@ -661,6 +721,8 @@ impl PapercraftContext {
             just_selected: None,
             selected_label: None,
             grabbed_label: None,
+            grabbed_island_name: None,
+            island_name_positions: Vec::new(),
             ui: UiSettings {
                 mode: MouseMode::Face,
                 trans_scene,
@@ -1220,11 +1282,16 @@ impl PapercraftContext {
                 }
             }
 
+            let mut name_positions = Vec::new();
             for (i_island, _) in self.papercraft().islands() {
                 // Island ids
                 let text = printable_island_name(&self.papercraft, i_island, &args, &extra);
+                let text_pos = text.pos;
+                let text_size = text.size;
                 text_builder.make_text(&text, &mut args.vertices_text);
+                name_positions.push((i_island, text_pos, text_size));
             }
+            self.island_name_positions = name_positions;
         }
 
         //TODO PrintableTexts duplicated here and in generate_pages???
@@ -2304,6 +2371,19 @@ impl PapercraftContext {
             return RebuildFlags::PAPER;
         }
 
+        // Island name drag: reposition island name
+        if let Some((key, offset)) = self.grabbed_island_name {
+            if !dragging {
+                return RebuildFlags::empty();
+            }
+            let click = self.ui.trans_paper.paper_click(size, pos);
+            if let Some(island) = self.papercraft.island_by_key_mut(key) {
+                island.set_name_pos(Some(click - offset));
+            }
+            self.modified = true;
+            return RebuildFlags::PAPER;
+        }
+
         // Check if any island is to be moved
         match (
             self.selected_islands.is_empty(),
@@ -2425,6 +2505,7 @@ impl PapercraftContext {
 
     #[must_use]
     pub fn paper_button1_drag_complete_event(&mut self) -> RebuildFlags {
+        self.grabbed_island_name = None;
         if let Some((_, _, sel, adding)) = self.pre_selection.take() {
             if adding {
                 for s in sel {
@@ -2449,6 +2530,7 @@ impl PapercraftContext {
         pos: Vector2,
         mods: KeyMod,
         modifiable: bool,
+        is_double_click: bool,
     ) -> RebuildFlags {
         // Label hit-test takes priority
         let click = self.ui.trans_paper.paper_click(size, pos);
@@ -2473,6 +2555,28 @@ impl PapercraftContext {
             self.selected_label = None;
             self.grabbed_label = None;
         }
+
+        // Island name hit-test
+        let name_positions = std::mem::take(&mut self.island_name_positions);
+        for &(i_island, name_pos, font_size) in &name_positions {
+            if (click - name_pos).magnitude() < font_size {
+                self.island_name_positions = name_positions;
+                if is_double_click {
+                    // Reset to auto-computed position
+                    if modifiable {
+                        if let Some(island) = self.papercraft.island_by_key_mut(i_island) {
+                            island.set_name_pos(None);
+                        }
+                        self.modified = true;
+                        return RebuildFlags::PAPER;
+                    }
+                } else if modifiable {
+                    self.grabbed_island_name = Some((i_island, click - name_pos));
+                }
+                return RebuildFlags::empty();
+            }
+        }
+        self.island_name_positions = name_positions;
 
         let selection = self.paper_analyze_click(
             self.ui.mode,
@@ -2578,6 +2682,7 @@ impl PapercraftContext {
         self.rotation_center = None;
         self.grabbed_island = None;
         self.grabbed_label = None;
+        self.grabbed_island_name = None;
         // Super is usually only handled in the 3d scene, however when doing bit rotations the mouse will hover
         // the paper, and it is convenient to check it here too, at least when hovering.
         if mods.contains(KeyMod::Super) {

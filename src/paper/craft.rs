@@ -175,6 +175,10 @@ fn default_edge_id_font_size() -> f32 {
     8.0
 }
 
+fn default_label_tab_threshold() -> f32 {
+    25.0 // mm²: 5mm × 5mm
+}
+
 fn default_scene_bg_color() -> MyColor {
     MyColor(Color::new(0.2, 0.2, 0.4, 1.0))
 }
@@ -297,6 +301,8 @@ pub struct PaperOptions {
     pub edge_id_position: EdgeIdPosition,
     #[serde(default)]
     pub island_name_only: bool,
+    #[serde(default = "default_label_tab_threshold")]
+    pub label_tab_threshold: f32,
     #[serde(default = "default_line3d_normal")]
     pub line3d_normal: LineConfig,
     #[serde(default = "default_line3d_rim")]
@@ -345,6 +351,7 @@ impl Default for PaperOptions {
             edge_id_font_size: default_edge_id_font_size(),
             edge_id_position: EdgeIdPosition::default(),
             island_name_only: false,
+            label_tab_threshold: default_label_tab_threshold(),
             line3d_normal: default_line3d_normal(),
             line3d_rim: default_line3d_rim(),
             line3d_rim_tab: default_line3d_rim_tab(),
@@ -861,6 +868,7 @@ impl Papercraft {
             rot: Rad(mx[0][1].atan2(mx[0][0])),
             mx: Matrix3::one(),
             name: String::new(),
+            name_pos: None,
         };
         new_island.recompute_matrix();
 
@@ -1647,6 +1655,7 @@ impl Papercraft {
                 loc,
                 mx: Matrix3::one(),
                 name,
+                name_pos: None,
             };
             island.recompute_matrix();
             self.islands.insert(island);
@@ -1659,6 +1668,7 @@ impl Papercraft {
                 loc: Vector2::zero(),
                 mx: Matrix3::one(),
                 name: String::new(),
+                name_pos: None,
             };
             self.islands.insert(island);
         }
@@ -1720,6 +1730,7 @@ impl Papercraft {
                 loc: Vector2::zero(),
                 mx: Matrix3::one(),
                 name: String::new(),
+                name_pos: None,
             });
         }
 
@@ -2139,6 +2150,8 @@ pub struct Island {
     loc: Vector2,
     mx: Matrix3,
     name: String,
+    /// User-overridden label position in paper space (None = auto-computed).
+    name_pos: Option<Vector2>,
 }
 
 impl Island {
@@ -2179,6 +2192,12 @@ impl Island {
     }
     pub fn name(&self) -> &str {
         &self.name
+    }
+    pub fn name_pos(&self) -> Option<Vector2> {
+        self.name_pos
+    }
+    pub fn set_name_pos(&mut self, pos: Option<Vector2>) {
+        self.name_pos = pos;
     }
 }
 
@@ -2268,11 +2287,16 @@ impl Serialize for Island {
     where
         S: serde::Serializer,
     {
-        let mut map = serializer.serialize_struct("Island", 4)?;
+        let fields = if self.name_pos.is_some() { 6 } else { 4 };
+        let mut map = serializer.serialize_struct("Island", fields)?;
         map.serialize_field("root", &usize::from(self.root))?;
         map.serialize_field("x", &self.loc.x)?;
         map.serialize_field("y", &self.loc.y)?;
         map.serialize_field("r", &self.rot.0)?;
+        if let Some(np) = self.name_pos {
+            map.serialize_field("lx", &np.x)?;
+            map.serialize_field("ly", &np.y)?;
+        }
         map.end()
     }
 }
@@ -2288,14 +2312,23 @@ impl<'de> Deserialize<'de> for Island {
             x: f32,
             y: f32,
             r: f32,
+            #[serde(default)]
+            lx: Option<f32>,
+            #[serde(default)]
+            ly: Option<f32>,
         }
         let d = Def::deserialize(deserializer)?;
+        let name_pos = match (d.lx, d.ly) {
+            (Some(lx), Some(ly)) => Some(Vector2::new(lx, ly)),
+            _ => None,
+        };
         let mut island = Island {
             root: FaceIndex::from(d.root),
             loc: Vector2::new(d.x, d.y),
             rot: Rad(d.r),
             mx: Matrix3::one(),
             name: String::new(),
+            name_pos,
         };
         island.recompute_matrix();
         Ok(island)

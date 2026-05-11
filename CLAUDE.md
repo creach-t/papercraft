@@ -388,6 +388,33 @@ canvas.width = Math.round(canvas.clientWidth * dpr);
 | `Papercraft::options_mut()` | `paper/craft.rs:568` | Accès mutable aux options sans passer par `set_options` |
 | `Papercraft::rebuild_island_names()` | `paper/craft.rs:752` | Assigne noms A/B/C… aux îles par aire décroissante |
 | `PapercraftContext::papercraft_mut()` | `ui.rs:594` | Accès mutable au `Papercraft` sous-jacent |
+| `Island::name_pos()` / `set_name_pos()` | `paper/craft.rs` | Position manuelle du nom d'île (None = auto) |
+| `PaperDrawFaceArgs::flap_tab_geometry()` | `ui.rs` | Aire, midpoint base, direction sortante et angle d'un tab |
+
+---
+
+## Placement des noms d'îles (`printable_island_name`)
+
+Fonction `printable_island_name()` dans `main.rs` — calcule la `PrintableText` pour le nom d'une île.
+
+### Priorité de placement
+1. **Position manuelle** (`island.name_pos().is_some()`) : utilise directement la position draggée par l'utilisateur, angle horizontal.
+2. **Mode Outside/None** :
+   - **Case 1** — meilleur tab disponible (via `best_label_tab()`) avec aire ≥ `label_tab_threshold` (défaut 25 mm²) : place le nom à `base_mid + outward * font_size`, aligné sur le bord du tab.
+   - **Case 2** — fallback : au-dessus du point le plus haut du périmètre, horizontal.
+3. **Mode Inside** : centre de masse de l'île, horizontal.
+
+### Persistance
+`Island.name_pos: Option<Vector2>` — sérialisé dans `.craft` comme `lx`/`ly` (absents si `None`, backward-compatible).
+
+### Interaction souris (preview 2D)
+- **Clic + drag** sur un nom d'île → repositionne librement (met à jour `name_pos`, marque modifié).
+- **Double-clic** sur un nom → remet à `None` (retour placement auto), déclenche rebuild.
+- `island_name_positions: Vec<(IslandKey, Vector2, f32)>` — cache peuplé à chaque `paper_rebuild` pour le hit-test.
+- `grabbed_island_name: Option<(IslandKey, Vector2)>` — état de drag dans `PapercraftContext`.
+
+### Option UI
+`PaperOptions.label_tab_threshold: f32` — exposé dans Document Properties sous "Label on tab threshold / mm²".
 
 ---
 

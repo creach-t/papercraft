@@ -25,6 +25,9 @@ impl GlobalContext {
     ) -> Result<()> {
         use crate::filters;
 
+        // Ensure island names (A, B, C...) are assigned before export.
+        self.data.papercraft_mut().rebuild_island_names();
+
         let res = match (
             file_name
                 .extension()
