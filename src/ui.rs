@@ -19,7 +19,7 @@ use crate::util_gl::{
     MSTATUS_HI, MSTATUS_SEL, MSTATUS_UNSEL, MStatus, MVertex2D, MVertex2DColor, MVertex2DLine,
     MVertex3D, MVertex3DLine, MVertexText,
 };
-use crate::{FONT_SIZE, TextBuilder};
+use crate::{pdf_metrics, FONT_SIZE, TextBuilder};
 use crate::{
     PrintableText, TextAlign,
     glr::{self, Rgba},
@@ -1350,6 +1350,83 @@ impl PapercraftContext {
                     text: model_dims_text.clone(),
                 };
                 text_builder.make_text(&dims_text, &mut vertices_label_text);
+
+                // Legend: Cut / Fold / Tab colored line samples below dimensions
+                {
+                    let options = self.papercraft.options();
+                    struct Entry { color: Rgba, dashed: bool, label: String }
+                    let cut  = options.cut_line_color.to_rgba();
+                    let fold = options.fold_line_color.to_rgba();
+                    let tab  = options.tab_line_color.to_rgba();
+                    let mut entries: Vec<Entry> = Vec::new();
+                    entries.push(Entry { color: cut,  dashed: false, label: tr!("Cut") });
+                    if options.fold_style != FoldStyle::None {
+                        entries.push(Entry { color: fold, dashed: true,  label: tr!("Fold") });
+                    }
+                    if options.flap_style != FlapStyle::None {
+                        entries.push(Entry { color: tab,  dashed: false, label: tr!("Tab") });
+                    }
+
+                    let font_size  = label.size.y * 0.09;
+                    let line_w     = label.size.y * 0.10;
+                    let line_h     = label.size.y * 0.012;
+                    let gap        = 0.8_f32; // mm between line sample and text
+                    let sep        = 2.5_f32; // mm between entries
+                    let legend_y   = p0.y + label.size.y * 0.84;
+
+                    let text_widths: Vec<f32> = entries.iter()
+                        .map(|e| {
+                            let (w, _) = pdf_metrics::measure_helvetica(&e.label);
+                            w as f32 * font_size / 1000.0
+                        })
+                        .collect();
+                    let entry_widths: Vec<f32> = text_widths.iter()
+                        .map(|&tw| line_w + gap + tw)
+                        .collect();
+                    let n = entries.len();
+                    let total_w = entry_widths.iter().sum::<f32>()
+                        + sep * n.saturating_sub(1) as f32;
+                    let mut x = (sep_x + p1.x) / 2.0 - total_w / 2.0;
+
+                    for (i, entry) in entries.iter().enumerate() {
+                        // Colored rect (line sample)
+                        let y0 = legend_y - line_h / 2.0;
+                        let y1 = legend_y + line_h / 2.0;
+                        let mk = |px: f32, py: f32| MVertex2DColor {
+                            pos_2d: Vector2::new(px, py),
+                            uv: uv0,
+                            mat,
+                            color: entry.color,
+                        };
+                        if entry.dashed {
+                            // Two short segments
+                            let sw = line_w * 0.38;
+                            let sg = line_w * 0.14;
+                            for sx in [x, x + sw + sg] {
+                                let tl = mk(sx, y0); let tr_ = mk(sx + sw, y0);
+                                let br = mk(sx + sw, y1); let bl = mk(sx, y1);
+                                vertices_label.extend_from_slice(&[tl, tr_, br, tl, br, bl]);
+                            }
+                        } else {
+                            let tl = mk(x, y0); let tr_ = mk(x + line_w, y0);
+                            let br = mk(x + line_w, y1); let bl = mk(x, y1);
+                            vertices_label.extend_from_slice(&[tl, tr_, br, tl, br, bl]);
+                        }
+
+                        // Text label
+                        let t = PrintableText {
+                            size: font_size,
+                            pos: Vector2::new(x + line_w + gap, legend_y),
+                            angle: Rad(0.0),
+                            align: TextAlign::Near,
+                            text: entry.label.clone(),
+                        };
+                        text_builder.make_text(&t, &mut vertices_label_text);
+
+                        x += entry_widths[i];
+                        if i + 1 < n { x += sep; }
+                    }
+                }
 
                 // Thumbnail: square on the left side
                 if has_thumb {

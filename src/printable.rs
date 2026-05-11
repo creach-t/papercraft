@@ -252,10 +252,10 @@ impl GlobalContext {
                     }
                     let sep_x_l = p0l.x + label.size.y;
 
-                    let font_size_pt = label.size.y * 0.11 * 72.0 / 25.4 / 1.1;
-                    let line_w_pt   = label.size.y * 0.13 * 72.0 / 25.4;
-                    let gap_pt      = 1.2_f32 * 72.0 / 25.4;
-                    let sep_pt      = 4.0_f32 * 72.0 / 25.4;
+                    let font_size_pt = label.size.y * 0.08 * 72.0 / 25.4 / 1.1;
+                    let line_w_pt   = label.size.y * 0.09 * 72.0 / 25.4;
+                    let gap_pt      = 0.8_f32 * 72.0 / 25.4;
+                    let sep_pt      = 2.5_f32 * 72.0 / 25.4;
 
                     let text_widths: Vec<f32> = entries.iter()
                         .map(|e| {
