@@ -235,8 +235,8 @@ impl GlobalContext {
                 let mut entries: Vec<Entry> = Vec::new();
                 entries.push(Entry { r: cut.r,  g: cut.g,  b: cut.b,  dashed: false, label: tr!("Cut") });
                 if options.fold_style != FoldStyle::None {
-                    entries.push(Entry { r: fold.r, g: fold.g, b: fold.b, dashed: false, label: tr!("Valley fold") });
-                    entries.push(Entry { r: fold.r, g: fold.g, b: fold.b, dashed: true,  label: tr!("Mountain fold") });
+                    entries.push(Entry { r: fold.r, g: fold.g, b: fold.b, dashed: true,  label: tr!("Valley fold") });
+                    entries.push(Entry { r: fold.r, g: fold.g, b: fold.b, dashed: false, label: tr!("Mountain fold") });
                 }
                 if options.flap_style != FlapStyle::None {
                     entries.push(Entry { r: tab.r,  g: tab.g,  b: tab.b,  dashed: false, label: tr!("Tab") });
