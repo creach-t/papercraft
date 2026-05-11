@@ -61,6 +61,7 @@ impl GlobalContext {
         let options = self.data.papercraft().options();
         let page_size_mm = Vector2::from(options.page_size);
         let edge_id_position = options.edge_id_position;
+        let (_, _, _, margin_bottom) = options.margin;
 
         let mut doc = Document::with_version("1.4");
         doc.reference_table.cross_reference_type = XrefType::CrossReferenceTable;
@@ -206,10 +207,6 @@ impl GlobalContext {
 
             let mut ops: Vec<Operation> = Vec::new();
 
-            if edge_id_position != EdgeIdPosition::Inside {
-                write_texts(&mut ops);
-            }
-
             let img_name = format!("IMG{page}");
 
             ops.push(Operation::new("q", vec![]));
@@ -225,8 +222,102 @@ impl GlobalContext {
             ops.push(Operation::new("Do", vec![img_name.clone().into()]));
             ops.push(Operation::new("Q", vec![]));
 
-            if edge_id_position == EdgeIdPosition::Inside {
-                write_texts(&mut ops);
+            // Always write texts after the image so they appear on top of the raster
+            write_texts(&mut ops);
+
+            // Legend: colored line samples at the bottom of the page
+            {
+                let font_size_pt = FONT_SIZE * 0.9 * 72.0 / 25.4 / 1.1;
+                let line_w_pt = 9.0_f32 * 72.0 / 25.4;
+                let gap_pt    = 1.5_f32 * 72.0 / 25.4;
+                let sep_pt    = 7.0_f32 * 72.0 / 25.4;
+
+                struct Entry { r: f32, g: f32, b: f32, dashed: bool, label: String }
+                let cut  = options.cut_line_color.to_rgba();
+                let fold = options.fold_line_color.to_rgba();
+                let tab  = options.tab_line_color.to_rgba();
+
+                let mut entries: Vec<Entry> = Vec::new();
+                entries.push(Entry { r: cut.r,  g: cut.g,  b: cut.b,  dashed: false, label: tr!("Cut") });
+                if options.fold_style != FoldStyle::None {
+                    entries.push(Entry { r: fold.r, g: fold.g, b: fold.b, dashed: true,  label: tr!("Fold") });
+                }
+                if options.flap_style != FlapStyle::None {
+                    entries.push(Entry { r: tab.r,  g: tab.g,  b: tab.b,  dashed: false, label: tr!("Tab") });
+                }
+
+                let text_widths: Vec<f32> = entries.iter()
+                    .map(|e| {
+                        let (w, _) = pdf_metrics::measure_helvetica(&e.label);
+                        w as f32 * font_size_pt / 1000.0
+                    })
+                    .collect();
+                let entry_widths: Vec<f32> = text_widths.iter()
+                    .map(|&tw| line_w_pt + gap_pt + tw)
+                    .collect();
+
+                let n = entries.len();
+                let total_pt  = entry_widths.iter().sum::<f32>()
+                    + sep_pt * n.saturating_sub(1) as f32;
+                let page_w_pt = page_size_mm.x * 72.0 / 25.4;
+                let start_x_pt = (page_w_pt - total_pt) / 2.0_f32;
+
+                // Y: one font-height above the signature row
+                let sig_y_mm = (page_size_mm.y - margin_bottom + FONT_SIZE)
+                    .min(page_size_mm.y - FONT_SIZE);
+                let legend_y_mm = sig_y_mm - FONT_SIZE * 1.7;
+                let legend_y_pt = (page_size_mm.y - legend_y_mm) * 72.0 / 25.4;
+                let line_mid_pt = legend_y_pt + font_size_pt * 0.3;
+
+                // Draw line samples
+                let mut x_pt = start_x_pt;
+                for (i, entry) in entries.iter().enumerate() {
+                    ops.push(Operation::new("q", vec![]));
+                    ops.push(Operation::new("RG", vec![
+                        entry.r.into(), entry.g.into(), entry.b.into(),
+                    ]));
+                    ops.push(Operation::new("w", vec![(1.2_f32).into()]));
+                    if entry.dashed {
+                        ops.push(Operation::new("d", vec![
+                            Object::Array(vec![Object::Integer(4), Object::Integer(2)]),
+                            Object::Integer(0),
+                        ]));
+                    }
+                    ops.push(Operation::new("m", vec![x_pt.into(), line_mid_pt.into()]));
+                    ops.push(Operation::new("l", vec![(x_pt + line_w_pt).into(), line_mid_pt.into()]));
+                    ops.push(Operation::new("S", vec![]));
+                    ops.push(Operation::new("Q", vec![]));
+                    x_pt += entry_widths[i];
+                    if i + 1 < n { x_pt += sep_pt; }
+                }
+
+                // Draw text labels
+                if !entries.is_empty() {
+                    ops.push(Operation::new("BT", vec![]));
+                    ops.push(Operation::new("Tf", vec!["F1".into(), font_size_pt.into()]));
+                    let mut x_pt = start_x_pt;
+                    for (i, entry) in entries.iter().enumerate() {
+                        let text_x = x_pt + line_w_pt + gap_pt;
+                        let mx: Vec<Object> = vec![
+                            1.0_f32.into(), 0.0_f32.into(),
+                            0.0_f32.into(), 1.0_f32.into(),
+                            text_x.into(), legend_y_pt.into(),
+                        ];
+                        ops.push(Operation::new("Tm", mx));
+                        let (_, cps) = pdf_metrics::measure_helvetica(&entry.label);
+                        let codepoints: Vec<u8> = cps
+                            .into_iter()
+                            .filter_map(|(_, cp)| u8::try_from(cp).ok())
+                            .collect();
+                        ops.push(Operation::new(
+                            "Tj",
+                            vec![Object::String(codepoints, StringFormat::Literal)],
+                        ));
+                        x_pt += entry_widths[i];
+                        if i + 1 < n { x_pt += sep_pt; }
+                    }
+                    ops.push(Operation::new("ET", vec![]));
+                }
             }
 
             let content = Content { operations: ops };
@@ -1052,6 +1143,14 @@ impl GlobalContext {
                     });
                 }
                 // Label titles as vector text (for PDF/SVG)
+                let model_dims_text = {
+                    let (v_min, v_max) = util_3d::bounding_box_3d(
+                        self.data.papercraft().model().vertices().map(|(_, v)| v.pos()),
+                    );
+                    let s = options.scale;
+                    let d = (v_max - v_min) * s;
+                    tr!("W:{:.0}  H:{:.0}  D:{:.0}  mm", d.x, d.y, d.z)
+                };
                 for (_key, label) in self.data.papercraft().labels() {
                     let p0 = label.pos;
                     let p1 = label.pos + label.size;
@@ -1066,16 +1165,22 @@ impl GlobalContext {
                     {
                         continue;
                     }
-                    let title_font_size = label.size.y * 0.35;
+                    let cx = (sep_x + p1.x) / 2.0 - page_pos.x;
+                    let title_font_size = label.size.y * 0.28;
+                    let dims_font_size = label.size.y * 0.16;
                     texts.push(PrintableText {
                         size: title_font_size,
-                        pos: Vector2::new(
-                            (sep_x + p1.x) / 2.0 - page_pos.x,
-                            (p0.y + p1.y) / 2.0 - page_pos.y,
-                        ),
+                        pos: Vector2::new(cx, p0.y + label.size.y * 0.38 - page_pos.y),
                         angle: Rad(0.0),
                         align: TextAlign::Center,
-                        text: label.title.clone(),
+                        text: label.title.to_uppercase(),
+                    });
+                    texts.push(PrintableText {
+                        size: dims_font_size,
+                        pos: Vector2::new(cx, p0.y + label.size.y * 0.65 - page_pos.y),
+                        angle: Rad(0.0),
+                        align: TextAlign::Center,
+                        text: model_dims_text.clone(),
                     });
                 }
 

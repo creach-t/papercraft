@@ -447,6 +447,7 @@ enum FileAction {
     ExportObj,
     GeneratePrintable,
     Generate3dPdf,
+    GenerateInteractive3dPdf,
 }
 
 impl FileAction {
@@ -459,6 +460,7 @@ impl FileAction {
             FileAction::ExportObj => tr!("Exporting..."),
             FileAction::GeneratePrintable => tr!("Generating..."),
             FileAction::Generate3dPdf => tr!("Generating 3D PDF..."),
+            FileAction::GenerateInteractive3dPdf => tr!("Generating Interactive 3D Viewer..."),
         }
     }
     fn is_save(&self) -> bool {
@@ -467,7 +469,7 @@ impl FileAction {
             | FileAction::OpenCraftReadOnly
             | FileAction::ImportModel
             | FileAction::UpdateObj => false,
-            FileAction::SaveAsCraft | FileAction::ExportObj | FileAction::GeneratePrintable | FileAction::Generate3dPdf => true,
+            FileAction::SaveAsCraft | FileAction::ExportObj | FileAction::GeneratePrintable | FileAction::Generate3dPdf | FileAction::GenerateInteractive3dPdf => true,
         }
     }
 }
@@ -699,6 +701,7 @@ struct MenuActions {
     export_obj: bool,
     generate_printable: bool,
     generate_3d_pdf: bool,
+    generate_interactive_3d_pdf: bool,
     quit: BoolWithConfirm,
     reset_views: bool,
     undo: bool,
@@ -1969,6 +1972,12 @@ impl GlobalContext {
                 {
                     menu_actions.generate_3d_pdf = true;
                 }
+                if ui
+                    .menu_item_config(lbl(tr!("Export Interactive 3D Viewer (.html)...")))
+                    .build()
+                {
+                    menu_actions.generate_interactive_3d_pdf = true;
+                }
                 ui.separator();
                 if ui
                     .menu_item_config(lbl(tr!("Settings...")))
@@ -2587,6 +2596,18 @@ impl GlobalContext {
             ));
             open_file_dialog = true;
         }
+        if menu_actions.generate_interactive_3d_pdf {
+            let mut chooser = filechooser::FileChooser::new();
+            let _ = chooser.set_path(&self.last_path);
+            chooser.add_filter(filters::html());
+            chooser.add_filter(filters::all_files());
+            self.file_dialog = Some(FileDialog::new(
+                chooser,
+                tr!("Export Interactive 3D Viewer..."),
+                FileAction::GenerateInteractive3dPdf,
+            ));
+            open_file_dialog = true;
+        }
 
         // There are two Wait modals and two Error modals. One pair over the FileDialog, the other to be opened directly ("Save").
 
@@ -2749,7 +2770,7 @@ impl GlobalContext {
                 true
             }
             _ => {
-                log::error!("Thumbnail discarded {full_path:?}");
+                log::debug!("Thumbnail discarded {full_path:?}");
                 false
             }
         }
@@ -3225,6 +3246,9 @@ impl GlobalContext {
             }
             FileAction::Generate3dPdf => {
                 self.generate_3d_pdf_views(file_name)?;
+            }
+            FileAction::GenerateInteractive3dPdf => {
+                self.generate_interactive_3d_pdf(file_name)?;
             }
         }
         Ok(())
@@ -3797,6 +3821,166 @@ impl GlobalContext {
         doc.save(file_name)
             .with_context(|| tr!("Error saving file {}", file_name.display()))?;
 
+        Ok(())
+    }
+
+    /// Generate a self-contained HTML file with an interactive 3D viewer.
+    /// Features: cut-edge display, hover-to-inspect pieces (flat 2D panel + label).
+    fn generate_interactive_3d_pdf(&mut self, file_name: &Path) -> Result<()> {
+        use cgmath::Transform;
+        use std::fmt::Write as FmtWrite;
+        use std::collections::HashMap;
+
+        // Island names are lazily assigned during UI render — force-assign them now
+        // so the exported HTML carries the same labels as the printable.
+        self.data.papercraft_mut().rebuild_island_names();
+
+        let papercraft = self.data.papercraft();
+        let model = papercraft.model();
+        let obj_mat = self.data.ui.trans_scene.obj;
+        let scale = papercraft.options().scale;
+
+        // ---------- textures ----------
+        let textures: Vec<Option<image::RgbImage>> = model
+            .textures()
+            .map(|t| t.pixbuf().map(|i| i.to_rgb8()))
+            .collect();
+
+        // ---------- per-face colour (sample texture at avg UV or grey) ----------
+        let face_colors: Vec<[f32; 3]> = model
+            .faces()
+            .map(|(_, face)| {
+                let mat_idx = usize::from(face.material());
+                let vs = face.index_vertices();
+                let tex_opt = textures.get(mat_idx).and_then(|o| o.as_ref());
+                if let Some(img) = tex_opt {
+                    let w = img.width() as f32;
+                    let h = img.height() as f32;
+                    let mut u_sum = 0.0f32;
+                    let mut v_sum = 0.0f32;
+                    for vi in &vs {
+                        let uv = model[*vi].uv();
+                        u_sum += uv.x;
+                        v_sum += uv.y;
+                    }
+                    let u = (u_sum / 3.0).fract().abs();
+                    let v = (v_sum / 3.0).fract().abs();
+                    let px_x = ((u * w) as u32).min(img.width() - 1);
+                    let px_y = (((1.0 - v) * h) as u32).min(img.height() - 1);
+                    let px = img.get_pixel(px_x, px_y);
+                    [px[0] as f32 / 255.0, px[1] as f32 / 255.0, px[2] as f32 / 255.0]
+                } else {
+                    [0.78, 0.78, 0.78]
+                }
+            })
+            .collect();
+
+        // ---------- assign sequential island indices ----------
+        let mut island_seq: HashMap<paper::IslandKey, u32> = HashMap::new();
+        for (key, _) in papercraft.islands() {
+            let idx = island_seq.len() as u32;
+            island_seq.insert(key, idx);
+        }
+
+        // ---------- VERTS: [x3d,y3d,z3d, r,g,b, island_f] × 3 per face (7 floats/vertex) ----------
+        let mut verts_data: Vec<f32> = Vec::new();
+        for (i_face, face) in model.faces() {
+            let vs = face.index_vertices();
+            let col = face_colors[usize::from(i_face)];
+            let island_key = papercraft.island_by_face(i_face);
+            let island_f = island_seq.get(&island_key).copied().unwrap_or(0) as f32;
+            for vi in &vs {
+                let p = model[*vi].pos();
+                let tp = obj_mat.transform_point(cgmath::Point3::new(p.x, p.y, p.z));
+                verts_data.extend_from_slice(&[tp.x, tp.y, tp.z, col[0], col[1], col[2], island_f]);
+            }
+        }
+
+        // ---------- EDGES: [x3d,y3d,z3d] per endpoint, 2 per cut edge ----------
+        let mut edges_data: Vec<f32> = Vec::new();
+        for (i_edge, edge) in model.edges() {
+            if matches!(papercraft.edge_status(i_edge), paper::EdgeStatus::Cut(_)) {
+                let (v0, v1) = model.edge_pos(edge);
+                let tp0 = obj_mat.transform_point(cgmath::Point3::new(v0.x, v0.y, v0.z));
+                let tp1 = obj_mat.transform_point(cgmath::Point3::new(v1.x, v1.y, v1.z));
+                edges_data.extend_from_slice(&[tp0.x, tp0.y, tp0.z, tp1.x, tp1.y, tp1.z]);
+            }
+        }
+
+        // ---------- ISLANDS: per-island flat 2D data for the panel ----------
+        // flat: [x0,y0, x1,y1, x2,y2, r,g,b] per triangle (9 floats)
+        struct IslandExport {
+            name: String,
+            flat: Vec<f32>,
+        }
+        let n_islands = island_seq.len();
+        let mut island_exports: Vec<IslandExport> = (0..n_islands)
+            .map(|_| IslandExport { name: String::new(), flat: Vec::new() })
+            .collect();
+
+        for (island_key, island) in papercraft.islands() {
+            let idx = island_seq[&island_key] as usize;
+            let n = island.name();
+            island_exports[idx].name = if n.is_empty() { "?".to_string() } else { n.to_string() };
+
+            let _ = papercraft.traverse_faces(island, |i_face, face, mx| {
+                let plane = model.face_plane(face);
+                let vs = face.index_vertices();
+                let col = face_colors[usize::from(i_face)];
+                // 2D paper-space vertices
+                for vi in &vs {
+                    let p3d = model[*vi].pos();
+                    let p2d_local = plane.project(&p3d, scale);
+                    let p2d = mx.transform_point(cgmath::Point2::new(p2d_local.x, p2d_local.y));
+                    island_exports[idx].flat.push(p2d.x);
+                    island_exports[idx].flat.push(p2d.y);
+                }
+                island_exports[idx].flat.extend_from_slice(&col);
+                std::ops::ControlFlow::Continue(())
+            });
+        }
+
+        // ---------- serialise to JS ----------
+        let mut js_verts = String::with_capacity(verts_data.len() * 7 + 2);
+        js_verts.push('[');
+        for (i, &v) in verts_data.iter().enumerate() {
+            if i > 0 { js_verts.push(','); }
+            let _ = write!(js_verts, "{v:.5}");
+        }
+        js_verts.push(']');
+
+        let mut js_edges = String::with_capacity(edges_data.len() * 7 + 2);
+        js_edges.push('[');
+        for (i, &v) in edges_data.iter().enumerate() {
+            if i > 0 { js_edges.push(','); }
+            let _ = write!(js_edges, "{v:.5}");
+        }
+        js_edges.push(']');
+
+        let mut js_islands = String::from("[");
+        for (i, isl) in island_exports.iter().enumerate() {
+            if i > 0 { js_islands.push(','); }
+            let name_json = isl.name.replace('\\', "\\\\").replace('"', "\\\"");
+            let _ = write!(js_islands, r#"{{"name":"{name_json}","flat":["#);
+            for (j, &v) in isl.flat.iter().enumerate() {
+                if j > 0 { js_islands.push(','); }
+                let _ = write!(js_islands, "{v:.5}");
+            }
+            js_islands.push_str("]}");
+        }
+        js_islands.push(']');
+
+        let title = html_escape(&self.title(false));
+
+        // ---------- HTML template (no Rust format markers — use .replace()) ----------
+        let html = include_str!("viewer3d_template.html")
+            .replace("__TITLE__", &title)
+            .replace("__VERTS__", &js_verts)
+            .replace("__EDGES__", &js_edges)
+            .replace("__ISLANDS__", &js_islands);
+
+        std::fs::write(file_name, html.as_bytes())
+            .with_context(|| tr!("Error saving file {}", file_name.display()))?;
         Ok(())
     }
 
@@ -4542,6 +4726,7 @@ mod filters {
     const PNG: FilterId = FilterId(8);
     const GLTF: FilterId = FilterId(9);
     pub const SVG_MULTIPAGE: FilterId = FilterId(10);
+    const HTML: FilterId = FilterId(11);
 
     pub fn ext(filter: Option<FilterId>) -> Option<&'static str> {
         let ext = match filter? {
@@ -4552,6 +4737,7 @@ mod filters {
             PDF => "pdf",
             SVG | SVG_MULTIPAGE => "svg",
             PNG => "png",
+            HTML => "html",
             _ => return None,
         };
         Some(ext)
@@ -4646,6 +4832,14 @@ mod filters {
         }
     }
 
+    pub fn html() -> Filter {
+        Filter {
+            id: HTML,
+            text: tr!("HTML viewer") + " (*.html)",
+            globs: vec![Pattern::new("*.html").unwrap()],
+        }
+    }
+
     pub fn all_files() -> Filter {
         Filter {
             id: ALL_FILES,
@@ -4653,6 +4847,10 @@ mod filters {
             globs: vec![],
         }
     }
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
 lazy_static! {
